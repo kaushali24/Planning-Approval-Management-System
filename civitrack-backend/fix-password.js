@@ -11,7 +11,7 @@ async function fixPassword() {
     // Update password for test applicant
     const result = await pool.query(
       'UPDATE applicants SET password_hash = $1 WHERE email = $2 RETURNING email, password_hash',
-      [newHash, 'nimal@example.com']
+      [newHash, 'kaushalinanayakkara2001@gmail.com']
     );
     
     console.log('✓ Password updated for:', result.rows[0]);

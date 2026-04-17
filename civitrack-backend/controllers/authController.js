@@ -1,8 +1,22 @@
 const bcrypt = require('bcryptjs');
 const pool = require('../config/db');
 const { generateToken } = require('../utils/jwt');
-const { validateApplicantRegistration } = require('../utils/validation');
-const { generateOTP, sendVerificationEmail } = require('../utils/emailService');
+const { validateApplicantRegistration, validateFullName, validatePhone, normalizePhone } = require('../utils/validation');
+const { generateOTP, sendVerificationEmail, sendPasswordResetEmail } = require('../utils/emailService');
+
+const hasDuplicateApplicantContact = async (client, normalizedContact, excludeApplicantId = null) => {
+  const { rows } = await client.query(
+    'SELECT id, contact_number FROM applicants WHERE contact_number IS NOT NULL'
+  );
+
+  return rows.some((row) => {
+    if (excludeApplicantId && Number(row.id) === Number(excludeApplicantId)) {
+      return false;
+    }
+
+    return normalizePhone(row.contact_number) === normalizedContact;
+  });
+};
 
 // Helper: generate sequential applicant ID per year (APP/YYYY/00001)
 const getNextApplicantId = async (client) => {
@@ -10,11 +24,15 @@ const getNextApplicantId = async (client) => {
   const prefix = `APP/${year}/`;
 
   const { rows } = await client.query(
-    'SELECT applicant_id FROM applicants WHERE applicant_id LIKE $1 ORDER BY applicant_id DESC LIMIT 1',
+    `SELECT applicant_ref_id
+     FROM applicants
+     WHERE applicant_ref_id LIKE $1
+     ORDER BY applicant_ref_id DESC
+     LIMIT 1`,
     [`${prefix}%`]
   );
 
-  const lastId = rows[0]?.applicant_id;
+  const lastId = rows[0]?.applicant_ref_id;
   const lastSeq = lastId ? parseInt(lastId.split('/').pop(), 10) : 0;
   const nextSeq = Number.isNaN(lastSeq) ? 1 : lastSeq + 1;
   const padded = String(nextSeq).padStart(5, '0');
@@ -67,6 +85,15 @@ exports.register = async (req, res) => {
       return res.status(400).json({ error: 'NIC number already registered' });
     }
 
+    const normalizedContactNumber = normalizePhone(contactNumber);
+
+    // Check if contact number already used (normalized to handle +94 vs 0 format)
+    const hasDuplicateContact = await hasDuplicateApplicantContact(client, normalizedContactNumber);
+
+    if (hasDuplicateContact) {
+      return res.status(400).json({ error: 'Contact number already registered' });
+    }
+
     await client.query('BEGIN');
 
     const applicantId = await getNextApplicantId(client);
@@ -77,9 +104,9 @@ exports.register = async (req, res) => {
     const codeExpires = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
 
     const insertQuery = `
-      INSERT INTO applicants (applicant_id, full_name, nic_number, email, contact_number, password_hash, verification_code, verification_code_expires)
+      INSERT INTO applicants (applicant_ref_id, full_name, nic_number, email, contact_number, password_hash, verification_code, verification_code_expires)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      RETURNING id, applicant_id, full_name, nic_number, email, contact_number, email_verified, created_at;
+      RETURNING id, applicant_ref_id AS applicant_id, full_name, nic_number, email, contact_number, email_verified, created_at;
     `;
 
     const { rows } = await client.query(insertQuery, [
@@ -87,7 +114,7 @@ exports.register = async (req, res) => {
       fullName,
       nicNumber,
       email,
-      contactNumber,
+      normalizedContactNumber,
       hashedPassword,
       verificationCode,
       codeExpires,
@@ -137,7 +164,7 @@ exports.login = async (req, res) => {
 
     // Fetch from applicants or staff (email should be unique across both)
     const query = `
-      SELECT id, applicant_id AS external_id, 'applicant' AS account_type, 'applicant' AS role,
+                  SELECT id, applicant_ref_id AS external_id, 'applicant' AS account_type, 'applicant' AS role,
              full_name, nic_number, contact_number, email, password_hash, email_verified
       FROM applicants WHERE email = $1 AND is_active = true
       UNION ALL
@@ -213,7 +240,7 @@ exports.getCurrentUser = async (req, res) => {
 
     if (accountType === 'applicant') {
       const { rows } = await pool.query(
-        `SELECT id, applicant_id, full_name, nic_number, email, contact_number, created_at, is_active
+        `SELECT id, applicant_ref_id AS applicant_id, full_name, nic_number, email, contact_number, created_at, is_active
          FROM applicants WHERE id = $1`,
         [userId]
       );
@@ -447,6 +474,67 @@ exports.changePassword = async (req, res) => {
   }
 };
 
+// Update applicant profile (authenticated)
+exports.updateProfile = async (req, res) => {
+  try {
+    const { accountType, userId } = req.user || {};
+    const { fullName, contactNumber } = req.body;
+
+    if (!accountType || !userId) {
+      return res.status(400).json({ error: 'Invalid token or session' });
+    }
+
+    if (accountType !== 'applicant') {
+      return res.status(403).json({ error: 'Only applicants can update this profile section' });
+    }
+
+    if (!fullName || !contactNumber) {
+      return res.status(400).json({ error: 'Full name and contact number are required' });
+    }
+
+    if (!validateFullName(fullName)) {
+      return res.status(400).json({ error: 'Invalid full name format' });
+    }
+
+    if (!validatePhone(contactNumber)) {
+      return res.status(400).json({ error: 'Invalid contact number format' });
+    }
+
+    const normalizedContactNumber = normalizePhone(contactNumber);
+    const hasDuplicateContact = await hasDuplicateApplicantContact(pool, normalizedContactNumber, userId);
+
+    if (hasDuplicateContact) {
+      return res.status(400).json({ error: 'Contact number already registered' });
+    }
+
+    const { rows } = await pool.query(
+      `UPDATE applicants
+       SET full_name = $1,
+           contact_number = $2,
+           updated_at = NOW()
+       WHERE id = $3
+       RETURNING id, applicant_ref_id AS applicant_id, full_name, nic_number, email, contact_number, email_verified, created_at, updated_at`,
+      [fullName.trim(), normalizedContactNumber, userId]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    return res.json({
+      message: 'Profile updated successfully',
+      user: {
+        ...rows[0],
+        role: 'applicant',
+        account_type: 'applicant',
+      },
+    });
+  } catch (error) {
+    console.error('Update profile error:', error);
+    return res.status(500).json({ error: 'Failed to update profile' });
+  }
+};
+
 // Admin: Reset staff password
 exports.resetStaffPassword = async (req, res) => {
   try {
@@ -505,7 +593,7 @@ exports.verifyEmail = async (req, res) => {
     }
 
     const { rows } = await pool.query(
-      'SELECT id, applicant_id, full_name, email, verification_code, verification_code_expires, email_verified FROM applicants WHERE email = $1',
+      'SELECT id, applicant_ref_id AS applicant_id, full_name, email, verification_code, verification_code_expires, email_verified FROM applicants WHERE email = $1',
       [email]
     );
 

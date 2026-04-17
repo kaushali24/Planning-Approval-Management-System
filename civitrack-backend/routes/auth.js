@@ -16,6 +16,7 @@ router.post('/reset-password', authController.resetPassword);
 
 // Protected routes (authenticated users)
 router.get('/me', authMiddleware, authController.getCurrentUser);
+router.patch('/profile', authMiddleware, authController.updateProfile);
 router.post('/change-password', authMiddleware, authController.changePassword);
 
 // Admin-only routes

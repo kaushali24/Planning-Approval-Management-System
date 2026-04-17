@@ -1,6 +1,6 @@
 # CiviTrack - Planning Approval Management System
 
-A production-ready React + Vite application for managing planning permit approvals in Kelaniya Pradeshiya Sabha. Handles Building Permits, Boundary Wall Permits, and Land Subdivision approvals with role-based workflows.
+A production-ready React + Vite application for managing planning permit approvals in Kelaniya Pradeshiya Sabha. Handles Building Permits and Land Subdivision approvals, with boundary wall requests captured via permit selections in the application workflow.
 
 ## Quick Start
 
@@ -28,7 +28,7 @@ Navigate to `http://localhost:5173/login`, select a role, and explore.
 
 ### Applicant Features
 - **Dashboard**: Stats cards and recent activity
-- **Application Wizard**: 5-step form for building permits, boundary walls, subdivisions
+- **Application Wizard**: 5-step form for building/subdivision applications with boundary wall permit selection support
 - **File Upload**: Drag-and-drop document submission
 - **Application Tracking**: View status with color-coded badges
 - **COC Requests**: Submit Certificate of Conformity

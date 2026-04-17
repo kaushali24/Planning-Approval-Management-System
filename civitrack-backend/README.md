@@ -26,6 +26,18 @@ CREATE DATABASE civitrack_db;
 psql -U postgres -d civitrack_db -f database/schema.sql
 ```
 
+**Seed sample data for testing:**
+```bash
+npm run seed:sample
+```
+
+**Backfill/fix demo workflow integrity gaps:**
+```bash
+npm run seed:demo:fix
+```
+
+This creates two applicant logins and sample workflow rows. The seeded applicant emails are `kaushalinanayakkara2001@gmail.com` and `pabodakaushali2001@gmail.com`.
+
 ### 4. Environment Configuration
 
 Copy `.env.example` to `.env`:
@@ -73,7 +85,7 @@ Expected response:
 {
   "fullName": "Nimal Perera",
   "nicNumber": "198012345678",
-  "email": "nimal@example.com",
+  "email": "kaushalinanayakkara2001@gmail.com",
   "contactNumber": "071234567",
   "password": "password123"
 }
@@ -82,7 +94,7 @@ Expected response:
 **POST** `/api/auth/login` - Login (applicant & staff)
 ```json
 {
-  "email": "nimal@example.com",
+  "email": "kaushalinanayakkara2001@gmail.com",
   "password": "password123"
 }
 ```
@@ -93,22 +105,23 @@ Expected response:
 **POST** `/api/auth/forgot-password` - Request password reset
 ```json
 {
-  "email": "nimal@example.com"
+  "email": "kaushalinanayakkara2001@gmail.com"
 }
 ```
 
 **POST** `/api/auth/verify-token` - Verify reset token
 ```json
 {
-  "email": "nimal@example.com",
+  "email": "kaushalinanayakkara2001@gmail.com",
   "token": "123456"
 }
 ```
 
+
 **POST** `/api/auth/reset-password` - Reset password
 ```json
 {
-  "email": "nimal@example.com",
+  "email": "kaushalinanayakkara2001@gmail.com",
   "token": "123456",
   "newPassword": "newpassword123"
 }
@@ -142,6 +155,23 @@ civitrack-backend/
 2. Test registration - get token
 3. Use token for protected routes
 4. Test forgot password flow
+
+## Verification Commands
+
+Run unit + integration tests:
+```bash
+npm test
+```
+
+Run DB-backed smoke workflow tests and strict workflow audit:
+```bash
+npm run test:backend
+```
+
+Run workflow audit only:
+```bash
+npm run audit:workflow
+```
 
 ## Notes
 

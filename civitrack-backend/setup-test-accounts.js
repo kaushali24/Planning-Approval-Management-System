@@ -11,11 +11,11 @@ const pool = require('./config/db');
 const testAccounts = {
   applicants: [
     {
-      applicantId: 'APP/2026/00001',
-      fullName: 'Nimal Jayasinghe',
-      nicNumber: '123456789V',
-      email: 'nimal@example.com',
-      contactNumber: '0712345678',
+      applicantId: 'APP/2026/00002',
+      fullName: 'Paboda Kaushali',
+      nicNumber: '200112345679',
+      email: 'pabodakaushali2001@gmail.com',
+      contactNumber: '0712345679',
       password: 'Admin@123',
     }
   ],
@@ -69,6 +69,26 @@ async function hashPassword(password) {
   return await bcrypt.hash(password, 10);
 }
 
+async function getNextApplicantId() {
+  const year = new Date().getFullYear();
+  const prefix = `APP/${year}/`;
+
+  const result = await pool.query(
+    `SELECT applicant_id
+     FROM applicants
+     WHERE applicant_id LIKE $1
+     ORDER BY applicant_id DESC
+     LIMIT 1`,
+    [`${prefix}%`]
+  );
+
+  const lastId = result.rows[0]?.applicant_id;
+  const lastSeq = lastId ? parseInt(lastId.split('/').pop(), 10) : 0;
+  const nextSeq = Number.isNaN(lastSeq) ? 1 : lastSeq + 1;
+
+  return `${prefix}${String(nextSeq).padStart(5, '0')}`;
+}
+
 async function insertApplicants() {
   console.log('📝 Inserting Applicant Test Accounts...\n');
 
@@ -87,13 +107,23 @@ async function insertApplicants() {
         continue;
       }
 
+      let applicantId = applicant.applicantId;
+      const applicantIdCheck = await pool.query(
+        'SELECT id FROM applicants WHERE applicant_id = $1',
+        [applicantId]
+      );
+
+      if (applicantIdCheck.rows.length > 0) {
+        applicantId = await getNextApplicantId();
+      }
+
       // Insert applicant
       const result = await pool.query(
         `INSERT INTO applicants (applicant_id, full_name, nic_number, email, contact_number, password_hash, email_verified, is_active)
          VALUES ($1, $2, $3, $4, $5, $6, true, true)
          RETURNING id, email, full_name, applicant_id`,
         [
-          applicant.applicantId,
+          applicantId,
           applicant.fullName,
           applicant.nicNumber,
           applicant.email,
@@ -134,16 +164,19 @@ async function insertStaffAccounts() {
       }
 
       // Insert staff account
+      const createdBy = null;
+
       const result = await pool.query(
         `INSERT INTO staff_accounts (staff_id, full_name, email, role, password_hash, is_active, created_by, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, true, 1, NOW(), NOW())
+         VALUES ($1, $2, $3, $4, $5, true, $6, NOW(), NOW())
          RETURNING id, staff_id, email, role, full_name`,
         [
           staff.staffId,
           staff.fullName,
           staff.email,
           staff.role,
-          hashedPassword
+          hashedPassword,
+          createdBy
         ]
       );
 

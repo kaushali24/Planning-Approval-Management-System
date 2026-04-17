@@ -49,9 +49,26 @@ const validateNIC = (nic) => {
  * Validate Sri Lankan phone number
  * Format: 0xxxxxxxxx (10 digits) or +94xxxxxxxxx
  */
+const normalizePhone = (phone) => {
+  if (!phone) return null;
+
+  const digits = String(phone).replace(/\D/g, '');
+
+  // Local format: 0XXXXXXXXX
+  if (/^0\d{9}$/.test(digits)) {
+    return digits;
+  }
+
+  // International format: 94XXXXXXXXX -> 0XXXXXXXXX
+  if (/^94\d{9}$/.test(digits)) {
+    return `0${digits.slice(2)}`;
+  }
+
+  return null;
+};
+
 const validatePhone = (phone) => {
-  const phoneRegex = /^(\+94|0)[0-9]{9}$/;
-  return phoneRegex.test(phone);
+  return !!normalizePhone(phone);
 };
 
 /**
@@ -113,6 +130,7 @@ module.exports = {
   validatePassword,
   validateNIC,
   validatePhone,
+  normalizePhone,
   validateFullName,
   validateApplicantRegistration
 };

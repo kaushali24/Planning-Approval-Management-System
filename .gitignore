@@ -19,6 +19,7 @@ dist/
 build/
 **/dist/
 **/build/
+civitrack-react/.smoke-artifacts/
 
 # Logs
 logs/
