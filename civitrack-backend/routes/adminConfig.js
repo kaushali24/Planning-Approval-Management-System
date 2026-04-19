@@ -13,6 +13,7 @@ router.get('/documents', adminConfigController.getDocumentChecklistConfig);
 router.get('/overview-stats', adminConfigController.getAdminOverviewStats);
 router.get('/system-logs', adminConfigController.getSystemLogs);
 router.get('/fees', adminConfigController.getFeeConfiguration);
+router.get('/settings', adminConfigController.getSystemSettings);
 
 router.patch(
   '/documents/:key',
@@ -24,6 +25,17 @@ router.patch(
   body('sortOrder').optional().isInt({ min: 0, max: 10000 }),
   validateRequest,
   adminConfigController.upsertDocumentChecklistItem
+);
+
+router.patch(
+  '/settings/:key',
+  param('key')
+    .trim()
+    .isIn(['email_notifications', 'auto_assignment', 'data_backup'])
+    .withMessage('key must be one of email_notifications, auto_assignment, data_backup'),
+  body('enabled').isBoolean().withMessage('enabled must be a boolean'),
+  validateRequest,
+  adminConfigController.updateSystemSetting
 );
 
 router.patch(

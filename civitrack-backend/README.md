@@ -18,12 +18,12 @@ npm install
 
 **Create PostgreSQL database:**
 ```sql
-CREATE DATABASE civitrack_db;
+CREATE DATABASE planning_app_db;
 ```
 
 **Run schema:**
 ```bash
-psql -U postgres -d civitrack_db -f database/schema.sql
+psql -U postgres -d planning_app_db -f database/schema.sql
 ```
 
 **Seed sample data for testing:**
@@ -47,7 +47,7 @@ cp .env.example .env
 
 Edit `.env` with your database credentials:
 ```
-DATABASE_URL=postgresql://username:password@localhost:5432/civitrack_db
+DATABASE_URL=postgresql://username:password@localhost:5432/planning_app_db
 JWT_SECRET=your_super_secret_jwt_key_change_this_in_production
 PORT=5000
 NODE_ENV=development

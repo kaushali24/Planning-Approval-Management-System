@@ -1,5 +1,6 @@
 const pool = require('../config/db');
 const bcrypt = require('bcryptjs');
+const { validatePassword } = require('../utils/validation');
 
 const STAFF_ROLES = ['planning_officer', 'technical_officer', 'superintendent', 'committee', 'admin'];
 const TEMP_PASSWORD_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$%';
@@ -92,9 +93,10 @@ exports.getStaffAccounts = async (req, res) => {
 
 exports.createStaffAccount = async (req, res) => {
   try {
-    const { fullName, email, role } = req.body;
+    const { fullName, email, role, password } = req.body;
     const normalizedEmail = (email || '').toString().trim().toLowerCase();
     const normalizedRole = (role || '').toString().trim();
+    const normalizedPassword = typeof password === 'string' ? password.trim() : '';
     const createdBy = req.user?.userId || null;
 
     if (!fullName || !normalizedEmail || !normalizedRole) {
@@ -110,8 +112,20 @@ exports.createStaffAccount = async (req, res) => {
       return res.status(409).json({ error: 'An account with this email already exists' });
     }
 
-    const temporaryPassword = generateTemporaryPassword(12);
-    const passwordHash = await bcrypt.hash(temporaryPassword, 10);
+    let initialPassword = normalizedPassword;
+    let isTemporaryPassword = false;
+
+    if (initialPassword) {
+      const passwordValidation = validatePassword(initialPassword);
+      if (!passwordValidation.valid) {
+        return res.status(400).json({ error: passwordValidation.message });
+      }
+    } else {
+      initialPassword = generateTemporaryPassword(12);
+      isTemporaryPassword = true;
+    }
+
+    const passwordHash = await bcrypt.hash(initialPassword, 10);
 
     const created = await pool.query(
       `INSERT INTO staff_accounts (staff_id, full_name, email, role, password_hash, is_active, created_by, created_at, updated_at)
@@ -136,7 +150,8 @@ exports.createStaffAccount = async (req, res) => {
     res.status(201).json({
       message: 'Staff account created successfully',
       staffAccount: created.rows[0],
-      temporaryPassword,
+      temporaryPassword: isTemporaryPassword ? initialPassword : null,
+      usedTemporaryPassword: isTemporaryPassword,
     });
   } catch (error) {
     console.error('Create staff account error:', error);

@@ -1,7 +1,7 @@
 const bcrypt = require('bcryptjs');
 const pool = require('../config/db');
 const { generateToken } = require('../utils/jwt');
-const { validateApplicantRegistration, validateFullName, validatePhone, normalizePhone } = require('../utils/validation');
+const { validateApplicantRegistration, validateFullName, validatePhone, normalizePhone, validatePassword } = require('../utils/validation');
 const { generateOTP, sendVerificationEmail, sendPasswordResetEmail } = require('../utils/emailService');
 
 const hasDuplicateApplicantContact = async (client, normalizedContact, excludeApplicantId = null) => {
@@ -426,8 +426,9 @@ exports.changePassword = async (req, res) => {
       return res.status(400).json({ error: 'Invalid token or session' });
     }
 
-    if (newPassword.length < 8) {
-      return res.status(400).json({ error: 'New password must be at least 8 characters' });
+    const passwordValidation = validatePassword(newPassword);
+    if (!passwordValidation.valid) {
+      return res.status(400).json({ error: passwordValidation.message });
     }
 
     // Fetch user record depending on account type

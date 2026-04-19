@@ -1,6 +1,6 @@
 -- CiviTrack schema completeness + 3NF-oriented entity/attribute audit
 -- Run with:
--- psql -U postgres -d civitrack_db -f civitrack-backend/database/check_schema_completeness.sql
+-- psql -U postgres -d planning_app_db -f civitrack-backend/database/check_schema_completeness.sql
 
 -- 1) Required entities (tables)
 WITH expected_tables(table_name) AS (

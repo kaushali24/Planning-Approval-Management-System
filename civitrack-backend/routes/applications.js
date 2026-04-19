@@ -305,6 +305,19 @@ router.post(
   applicationController.assignApplication
 );
 
+
+/**
+ * PATCH /api/applications/:id/resubmit
+ * Resubmit application after corrections
+ */
+router.patch(
+  '/:id/resubmit',
+  authMiddleware,
+  param('id').isInt({ min: 1 }),
+  validateRequest,
+  applicationController.resubmitApplication
+);
+
 /**
  * GET /api/applications/:id/assignments
  * Get application assignment history
@@ -395,6 +408,17 @@ router.post(
   applicationController.uploadApplicationDocuments
 );
 
+router.post(
+  '/:id/resubmit-corrections',
+  authMiddleware,
+  requireRole(['applicant']),
+  param('id').isInt({ min: 1 }),
+  validateRequest,
+  documentController.upload.array('files', 20),
+  isApplicationOwner(pool),
+  applicationController.resubmitCorrections
+);
+
 router.get(
   '/:id/documents',
   authMiddleware,
@@ -453,6 +477,46 @@ router.post(
   validateCreateApplication,
   isApplicationOwner(pool),
   applicationController.submitDraft
+);
+
+/**
+ * POST /api/applications/:id/set-fee
+ * Set inspection fee (planning officer only)
+ */
+router.post(
+  '/:id/set-fee',
+  authMiddleware,
+  requireRole(['planning_officer', 'admin']),
+  param('id').isInt({ min: 1 }),
+  validateRequest,
+  applicationController.setApplicationFee
+);
+
+/**
+ * POST /api/applications/:id/verify-payment
+ * Verify application fee payment (planning officer only)
+ */
+router.post(
+  '/:id/verify-payment',
+  authMiddleware,
+  requireRole(['planning_officer', 'admin']),
+  param('id').isInt({ min: 1 }),
+  validateRequest,
+  applicationController.verifyApplicationPayment
+);
+
+/**
+ * POST /api/applications/:id/preliminary-check
+ * Record preliminary examination results (draft or final)
+ * Staff only
+ */
+router.post(
+  '/:id/preliminary-check',
+  authMiddleware,
+  requireRole(['planning_officer', 'technical_officer', 'superintendent', 'committee', 'admin']),
+  param('id').isInt({ min: 1 }),
+  validateRequest,
+  applicationController.recordPreliminaryCheck
 );
 
 /**

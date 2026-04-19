@@ -14,6 +14,20 @@ const DEFAULT_FEE_CONFIG = [
   },
 ];
 
+const DEFAULT_SYSTEM_SETTINGS = [
+  { setting_key: 'email_notifications', value_boolean: true },
+  { setting_key: 'auto_assignment', value_boolean: false },
+  { setting_key: 'data_backup', value_boolean: true },
+];
+
+const SYSTEM_SETTING_KEY_MAP = {
+  email_notifications: 'emailNotifications',
+  auto_assignment: 'autoAssignment',
+  data_backup: 'dataBackup',
+};
+
+const SYSTEM_SETTING_ALLOWED_KEYS = Object.keys(SYSTEM_SETTING_KEY_MAP);
+
 const ensureFeeConfigTable = async () => {
   await pool.query(
     `CREATE TABLE IF NOT EXISTS admin_fee_config (
@@ -33,6 +47,27 @@ const ensureFeeConfigTable = async () => {
        VALUES ($1, $2, $3, TRUE, NOW())
        ON CONFLICT (fee_type) DO NOTHING`,
       [fee.fee_type, fee.display_name, fee.amount]
+    );
+  }
+};
+
+const ensureSystemSettingsTable = async () => {
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS admin_system_settings (
+      id SERIAL PRIMARY KEY,
+      setting_key VARCHAR(100) UNIQUE NOT NULL,
+      value_boolean BOOLEAN NOT NULL,
+      updated_by INT REFERENCES staff_accounts(id) ON DELETE SET NULL,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`
+  );
+
+  for (const setting of DEFAULT_SYSTEM_SETTINGS) {
+    await pool.query(
+      `INSERT INTO admin_system_settings (setting_key, value_boolean, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (setting_key) DO NOTHING`,
+      [setting.setting_key, setting.value_boolean]
     );
   }
 };
@@ -131,14 +166,12 @@ exports.getAdminOverviewStats = async (req, res) => {
     const totalApplications = Number(applicationsResult.rows[0]?.count || 0);
     const activeStaff = Number(activeStaffResult.rows[0]?.count || 0);
     const pendingReviews = Number(pendingReviewsResult.rows[0]?.count || 0);
-    const systemHealth = 100;
 
     return res.json({
       stats: {
         totalApplications,
         activeStaff,
         pendingReviews,
-        systemHealth,
       },
       generatedAt: new Date().toISOString(),
     });
@@ -209,6 +242,72 @@ exports.getFeeConfiguration = async (req, res) => {
   } catch (error) {
     console.error('Get fee configuration error:', error);
     return res.status(500).json({ error: 'Failed to fetch fee configuration' });
+  }
+};
+
+exports.getSystemSettings = async (req, res) => {
+  try {
+    await ensureSystemSettingsTable();
+
+    const result = await pool.query(
+      `SELECT id, setting_key, value_boolean, updated_by, updated_at
+       FROM admin_system_settings
+       ORDER BY id ASC`
+    );
+
+    const settings = result.rows.reduce((acc, row) => {
+      const stateKey = SYSTEM_SETTING_KEY_MAP[row.setting_key];
+      if (stateKey) {
+        acc[stateKey] = row.value_boolean === true;
+      }
+      return acc;
+    }, {});
+
+    return res.json({
+      settings,
+      items: result.rows,
+    });
+  } catch (error) {
+    console.error('Get system settings error:', error);
+    return res.status(500).json({ error: 'Failed to fetch system settings' });
+  }
+};
+
+exports.updateSystemSetting = async (req, res) => {
+  try {
+    await ensureSystemSettingsTable();
+
+    const key = normalizeKey(req.params.key);
+    const enabled = req.body.enabled === true;
+    const actorId = req.user?.userId || null;
+
+    if (!SYSTEM_SETTING_ALLOWED_KEYS.includes(key)) {
+      return res.status(400).json({ error: 'Invalid setting key' });
+    }
+
+    const result = await pool.query(
+      `UPDATE admin_system_settings
+       SET value_boolean = $1,
+           updated_by = $2,
+           updated_at = NOW()
+       WHERE setting_key = $3
+       RETURNING id, setting_key, value_boolean, updated_by, updated_at`,
+      [enabled, actorId, key]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: 'System setting not found' });
+    }
+
+    return res.json({
+      message: 'System setting updated successfully',
+      setting: result.rows[0],
+      stateKey: SYSTEM_SETTING_KEY_MAP[key],
+      value: enabled,
+    });
+  } catch (error) {
+    console.error('Update system setting error:', error);
+    return res.status(500).json({ error: 'Failed to update system setting' });
   }
 };
 
