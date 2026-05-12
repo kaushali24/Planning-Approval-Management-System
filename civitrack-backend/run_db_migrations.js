@@ -35,7 +35,7 @@ const bootstrapBaseSchemaIfNeeded = async (client) => {
     throw new Error(`Base schema file not found at ${BASE_SCHEMA_PATH}`);
   }
 
-  console.log('Bootstrapping base schema from database/schema.sql (DB_BOOTSTRAP_SCHEMA enabled)...');
+  console.log('Bootstrapping base schema from database/schema_update.sql (DB_BOOTSTRAP_SCHEMA enabled)...');
   const schemaSql = fs.readFileSync(BASE_SCHEMA_PATH, 'utf8');
   await client.query(schemaSql);
   console.log('Base schema bootstrap completed.');
