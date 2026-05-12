@@ -48,6 +48,7 @@ Thumbs.db
 civitrack-backend/database/migration_*.sql
 civitrack-backend/database/schema_update.sql
 !civitrack-backend/database/schema.sql
+!civitrack-backend/database/schema_update.sql
 
 # Test files (optional - uncomment if you don't want to push tests)
 # **/test*.js

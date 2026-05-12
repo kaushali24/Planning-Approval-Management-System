@@ -8,7 +8,7 @@ const path = require('path');
 const pool = require('./config/db');
 
 const MIGRATIONS_DIR = path.join(__dirname, 'database', 'migrations');
-const BASE_SCHEMA_PATH = path.join(__dirname, 'database', 'schema.sql');
+const BASE_SCHEMA_PATH = path.join(__dirname, 'database', 'schema_update.sql');
 
 const shouldBootstrapBaseSchema = () => {
   const flag = (process.env.DB_BOOTSTRAP_SCHEMA || '').toLowerCase();
@@ -39,6 +39,11 @@ const bootstrapBaseSchemaIfNeeded = async (client) => {
   const schemaSql = fs.readFileSync(BASE_SCHEMA_PATH, 'utf8');
   await client.query(schemaSql);
   console.log('Base schema bootstrap completed.');
+
+  const nowHasApplications = await doesTableExist(client, 'applications');
+  if (!nowHasApplications) {
+    throw new Error('Base schema bootstrap did not create required table: applications');
+  }
 };
 
 const readMigrationFiles = () => {
