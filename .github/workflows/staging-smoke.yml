@@ -26,6 +26,7 @@ jobs:
     env:
       NODE_ENV: test
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/civitrack_smoke
+      DB_BOOTSTRAP_SCHEMA: "true"
       JWT_SECRET: smoke-secret
       EMAIL_USER: smoke@example.com
       EMAIL_PASSWORD: smoke-password

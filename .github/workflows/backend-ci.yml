@@ -30,6 +30,7 @@ jobs:
     env:
       NODE_ENV: test
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/civitrack_ci
+      DB_BOOTSTRAP_SCHEMA: "true"
       JWT_SECRET: ci-test-secret
       EMAIL_USER: ci@example.com
       EMAIL_PASSWORD: ci-password

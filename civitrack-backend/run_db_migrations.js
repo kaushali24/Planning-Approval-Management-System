@@ -8,6 +8,38 @@ const path = require('path');
 const pool = require('./config/db');
 
 const MIGRATIONS_DIR = path.join(__dirname, 'database', 'migrations');
+const BASE_SCHEMA_PATH = path.join(__dirname, 'database', 'schema.sql');
+
+const shouldBootstrapBaseSchema = () => {
+  const flag = (process.env.DB_BOOTSTRAP_SCHEMA || '').toLowerCase();
+  return flag === '1' || flag === 'true' || flag === 'yes';
+};
+
+const doesTableExist = async (client, tableName) => {
+  const result = await client.query('SELECT to_regclass($1) AS reg', [`public.${tableName}`]);
+  return Boolean(result.rows?.[0]?.reg);
+};
+
+const bootstrapBaseSchemaIfNeeded = async (client) => {
+  if (!shouldBootstrapBaseSchema()) {
+    return;
+  }
+
+  // If the base schema is already present, don't touch it.
+  const hasApplications = await doesTableExist(client, 'applications');
+  if (hasApplications) {
+    return;
+  }
+
+  if (!fs.existsSync(BASE_SCHEMA_PATH)) {
+    throw new Error(`Base schema file not found at ${BASE_SCHEMA_PATH}`);
+  }
+
+  console.log('Bootstrapping base schema from database/schema.sql (DB_BOOTSTRAP_SCHEMA enabled)...');
+  const schemaSql = fs.readFileSync(BASE_SCHEMA_PATH, 'utf8');
+  await client.query(schemaSql);
+  console.log('Base schema bootstrap completed.');
+};
 
 const readMigrationFiles = () => {
   const files = fs.readdirSync(MIGRATIONS_DIR)
@@ -38,6 +70,8 @@ const run = async () => {
     await client.query('BEGIN');
     await ensureSchemaMigrationsTable(client);
     await client.query('COMMIT');
+
+    await bootstrapBaseSchemaIfNeeded(client);
 
     const migrations = readMigrationFiles();
     for (const migration of migrations) {
