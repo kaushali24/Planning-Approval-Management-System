@@ -86,6 +86,24 @@ describe('permits integration', () => {
     );
   });
 
+  test('POST /api/permits/:applicationId/issue rejects max_years above 5', async () => {
+    const { app } = loadAppWithMocks({});
+
+    const response = await request(app)
+      .post('/api/permits/1/issue')
+      .send({ valid_until: '2026-12-01T00:00:00.000Z', max_years: 6 });
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual(
+      expect.objectContaining({
+        success: false,
+        error: expect.objectContaining({
+          code: 'PERMIT_MAX_YEARS_INVALID',
+        }),
+      })
+    );
+  });
+
   test('POST /api/permits/:applicationId/extend enforces extension limit', async () => {
     const { app } = loadAppWithMocks({
       clientQueryImpl: async (sql) => {
@@ -118,6 +136,78 @@ describe('permits integration', () => {
         error: expect.objectContaining({
           code: 'PERMIT_EXTENSION_LIMIT_REACHED',
           message: 'Maximum permit extension limit reached',
+        }),
+      })
+    );
+  });
+
+  test('POST /api/permits/:applicationId/extend requires completed payment evidence', async () => {
+    const { app } = loadAppWithMocks({
+      clientQueryImpl: async (sql) => {
+        if (sql.includes('FROM permit_workflow')) {
+          return {
+            rows: [
+              {
+                id: 500,
+                application_id: 1,
+                valid_until: '2026-12-01T00:00:00.000Z',
+                max_years: 5,
+                extensions_used: 1,
+                permit_type: 'building',
+              },
+            ],
+          };
+        }
+        return { rows: [] };
+      },
+    });
+
+    const response = await request(app)
+      .post('/api/permits/1/extend')
+      .send({ payment_status: 'pending', payment_reference: 'TXN-1', payment_method: 'online' });
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual(
+      expect.objectContaining({
+        success: false,
+        error: expect.objectContaining({
+          code: 'PERMIT_EXTENSION_PAYMENT_INCOMPLETE',
+        }),
+      })
+    );
+  });
+
+  test('POST /api/permits/:applicationId/collect rejects already collected permit', async () => {
+    const { app } = loadAppWithMocks({
+      clientQueryImpl: async (sql) => {
+        if (sql.includes('FROM permit_workflow')) {
+          return {
+            rows: [
+              {
+                id: 500,
+                application_id: 1,
+                permit_collected: true,
+                permit_type: 'building',
+                application_type: 'building',
+                application_status: 'permit_approved',
+              },
+            ],
+          };
+        }
+        return { rows: [] };
+      },
+    });
+
+    const response = await request(app)
+      .post('/api/permits/1/collect')
+      .send({ checks: [] });
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual(
+      expect.objectContaining({
+        success: false,
+        error: expect.objectContaining({
+          code: 'PERMIT_ALREADY_COLLECTED',
         }),
       })
     );

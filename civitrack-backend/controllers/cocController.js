@@ -1,6 +1,7 @@
 const { validationResult } = require('express-validator');
 const pool = require('../config/db');
 const { sendError } = require('../middleware/errorHandler');
+const { applyStatusTransition } = require('../utils/applicationStatusUpdater');
 
 const STAFF_ROLES = ['planning_officer', 'technical_officer', 'superintendent', 'committee', 'admin'];
 const COC_STATUSES = [
@@ -15,14 +16,10 @@ const COC_STATUSES = [
   'coc-rectification-in-progress',
   'reinspection-requested',
   'coc-fine-paid-regularization-pending',
-  'pending',
-  'inspection_scheduled',
-  'inspected',
-  'compliant',
-  'deviation',
-  'issued',
-  'rejected',
 ];
+const COC_PAYMENT_ALLOWED_STATUSES = ['requested', 'fee-calculated', 'coc-violations-found', 'coc-fine-paid-regularization-pending'];
+const COC_VIOLATION_ALLOWED_STATUSES = ['inspection-complete', 'paid', 'assigned-to-to', 'reinspection-requested'];
+const COC_REINSPECTION_ALLOWED_STATUSES = ['reinspection-requested', 'coc-rectification-in-progress', 'coc-fine-paid-regularization-pending'];
 
 const isApplicantUser = (user) => user.accountType === 'applicant' || user.role === 'applicant';
 const isStaffUser = (user) => STAFF_ROLES.includes(user.role);
@@ -38,19 +35,13 @@ const applyStatusWithFallback = async (client, applicationId, preferredStatuses,
   for (const status of preferredStatuses) {
     try {
       await client.query('SAVEPOINT app_status_attempt');
-
-      await client.query(
-        `UPDATE applications
-         SET status = $1, last_updated = NOW()
-         WHERE id = $2`,
-        [status, applicationId]
-      );
-
-      await client.query(
-        `INSERT INTO application_status_history (application_id, status, changed_by, reason)
-         VALUES ($1, $2, $3, $4)`,
-        [applicationId, status, changedBy, reason]
-      );
+      await applyStatusTransition({
+        client,
+        applicationId,
+        toStatus: status,
+        changedBy,
+        reason,
+      });
 
       await client.query('RELEASE SAVEPOINT app_status_attempt');
 
@@ -71,7 +62,7 @@ const applyStatusWithFallback = async (client, applicationId, preferredStatuses,
 
 const getAppById = async (applicationId) => {
   const result = await pool.query(
-    `SELECT id, applicant_id, status, application_type, submitted_applicant_name, submitted_email
+    `SELECT id, applicant_id, status, application_type, submitted_applicant_name, submitted_email, application_code
      FROM applications
      WHERE id = $1`,
     [applicationId]
@@ -102,6 +93,42 @@ const getCocWithOwnership = async (client, cocRequestId) => {
   return result.rows[0] || null;
 };
 
+const COC_STATUS_TRANSITIONS = {
+  requested: ['fee-calculated', 'paid'],
+  'fee-calculated': ['paid'],
+  paid: ['assigned-to-to'],
+  'assigned-to-to': ['inspection-complete', 'coc-violations-found'],
+  'inspection-complete': ['coc-approved'],
+  'coc-approved': ['coc-collected'],
+  'coc-violations-found': ['coc-rectification-in-progress', 'coc-fine-paid-regularization-pending'],
+  'coc-rectification-in-progress': ['reinspection-requested', 'coc-approved', 'coc-violations-found'],
+  'reinspection-requested': ['inspection-complete', 'coc-violations-found', 'coc-approved'],
+  'coc-fine-paid-regularization-pending': [],
+  'coc-collected': [],
+};
+
+const COC_ROLE_STATUS_UPDATES = {
+  planning_officer: ['fee-calculated', 'assigned-to-to'],
+  technical_officer: ['inspection-complete', 'coc-violations-found', 'coc-rectification-in-progress', 'reinspection-requested'],
+  committee: ['coc-approved', 'coc-collected'],
+  admin: COC_STATUSES,
+};
+
+const canTechnicalOfficerMutateCoc = async (client, cocRequestId, technicalOfficerId) => {
+  const check = await client.query(
+    `SELECT c.id
+     FROM coc_requests c
+     LEFT JOIN application_assignments aa
+       ON aa.application_id = c.application_id
+      AND aa.status IN ('pending', 'accepted', 'in_progress')
+     WHERE c.id = $1
+       AND (c.assigned_to = $2 OR aa.assigned_to = $2)
+     LIMIT 1`,
+    [cocRequestId, technicalOfficerId]
+  );
+  return check.rows.length > 0;
+};
+
 exports.createCocRequest = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -116,6 +143,14 @@ exports.createCocRequest = async (req, res) => {
     }
 
     const user = req.user;
+    if (!['applicant', 'planning_officer', 'admin'].includes(user.role)) {
+      return sendError(res, 403, 'Only applicant, planning officer, or admin can create COC requests', {
+        code: 'AUTH_FORBIDDEN',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
+
     const { application_id, notes, declarations = [] } = req.body;
 
     const application = await getAppById(application_id);
@@ -132,6 +167,15 @@ exports.createCocRequest = async (req, res) => {
         code: 'AUTH_FORBIDDEN',
         path: req.originalUrl,
         method: req.method,
+      });
+    }
+
+    if (application.status !== 'permit_collected') {
+      return sendError(res, 400, 'COC requests are available only after the permit has been collected for this application.', {
+        code: 'COC_NOT_ELIGIBLE',
+        path: req.originalUrl,
+        method: req.method,
+        details: { currentStatus: application.status },
       });
     }
 
@@ -221,9 +265,17 @@ exports.getCocRequests = async (req, res) => {
     if (isApplicantUser(user)) {
       where.push(`a.applicant_id = $${params.length + 1}`);
       params.push(user.userId);
-    } else if (isStaffUser(user) && user.role !== 'admin' && user.role !== 'committee') {
-      fromSql += ' LEFT JOIN application_assignments aa ON aa.application_id = a.id ';
-      where.push(`(aa.assigned_to = $${params.length + 1} OR c.assigned_to = $${params.length + 1})`);
+    } else if (user.role === 'technical_officer') {
+      // TOs only see COC work assigned to them; PO / admin / committee see full queues.
+      fromSql += ` LEFT JOIN LATERAL (
+        SELECT aa.assigned_to
+        FROM application_assignments aa
+        WHERE aa.application_id = a.id
+          AND aa.status IN ('pending', 'accepted', 'in_progress')
+        ORDER BY aa.assigned_at DESC, aa.id DESC
+        LIMIT 1
+      ) aa_latest ON TRUE `;
+      where.push(`(aa_latest.assigned_to = $${params.length + 1} OR c.assigned_to = $${params.length + 1})`);
       params.push(user.userId);
     }
 
@@ -242,6 +294,7 @@ exports.getCocRequests = async (req, res) => {
         c.id,
         c.coc_id,
         c.application_id,
+        a.application_code,
         c.status,
         c.request_date,
         c.applicant_name,
@@ -365,6 +418,7 @@ exports.updateCocStatus = async (req, res) => {
 
     const { id } = req.params;
     const { status, notes, assigned_to, fee_amount } = req.body;
+    const role = req.user?.role;
 
     if (!COC_STATUSES.includes(status)) {
       return sendError(res, 400, `Invalid status. Allowed: ${COC_STATUSES.join(', ')}`, {
@@ -387,6 +441,47 @@ exports.updateCocStatus = async (req, res) => {
     }
 
     const cocRequest = current.rows[0];
+    if (role === 'technical_officer') {
+      const ownsQueueItem = await canTechnicalOfficerMutateCoc(client, id, req.user.userId);
+      if (!ownsQueueItem) {
+        await client.query('ROLLBACK');
+        return sendError(res, 403, 'Technical Officer can only update assigned COC requests', {
+          code: 'AUTH_FORBIDDEN',
+          path: req.originalUrl,
+          method: req.method,
+        });
+      }
+    }
+    const roleAllowedStatuses = COC_ROLE_STATUS_UPDATES[role] || [];
+    if (!roleAllowedStatuses.includes(status)) {
+      await client.query('ROLLBACK');
+      return sendError(res, 403, `Role ${role} is not allowed to set COC status to ${status}`, {
+        code: 'AUTH_FORBIDDEN',
+        details: { role, requestedStatus: status },
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
+
+    const allowedNextStatuses = COC_STATUS_TRANSITIONS[cocRequest.status] || [];
+    if (!allowedNextStatuses.includes(status)) {
+      await client.query('ROLLBACK');
+      return sendError(res, 400, `Invalid COC status transition from ${cocRequest.status} to ${status}`, {
+        code: 'COC_INVALID_STATUS',
+        details: { currentStatus: cocRequest.status },
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
+    if (status === 'coc-collected' && cocRequest.status !== 'coc-approved') {
+      await client.query('ROLLBACK');
+      return sendError(res, 400, 'COC can only be marked collected after committee approval', {
+        code: 'COC_INVALID_STATUS',
+        details: { currentStatus: cocRequest.status },
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
 
     const updated = await client.query(
       `UPDATE coc_requests
@@ -396,18 +491,18 @@ exports.updateCocStatus = async (req, res) => {
            fee_amount = COALESCE($4, fee_amount),
            assigned_at = CASE WHEN $3 IS NOT NULL THEN NOW() ELSE assigned_at END,
            inspection_completed_at = CASE WHEN $1 = 'inspection-complete' THEN NOW() ELSE inspection_completed_at END,
-           issued_at = CASE WHEN $1 = 'issued' THEN NOW() ELSE issued_at END,
+          issued_at = CASE WHEN $1 = 'coc-approved' THEN NOW() ELSE issued_at END,
            collected_at = CASE WHEN $1 = 'coc-collected' THEN NOW() ELSE collected_at END
        WHERE id = $5
        RETURNING *`,
       [status, notes || null, assigned_to || null, fee_amount || null, id]
     );
 
-    if (['issued', 'coc-approved'].includes(status)) {
+    if (status === 'coc-approved') {
       await applyStatusWithFallback(
         client,
         cocRequest.application_id,
-        ['coc_issued', 'approved', 'certified'],
+        ['coc_issued'],
         getChangedByStaffId(req.user),
         `COC moved to ${status}`
       );
@@ -451,11 +546,28 @@ exports.addDeclaration = async (req, res) => {
 
     const { id } = req.params;
     const { declaration_type, accepted = true } = req.body;
+    const user = req.user;
 
-    const cocResult = await pool.query('SELECT id FROM coc_requests WHERE id = $1', [id]);
+    if (!['applicant', 'admin'].includes(user?.role)) {
+      return sendError(res, 403, 'Only applicant or admin can submit declarations', {
+        code: 'AUTH_FORBIDDEN',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
+
+    const cocResult = await pool.query('SELECT id, applicant_id FROM coc_requests WHERE id = $1', [id]);
     if (!cocResult.rows.length) {
       return sendError(res, 404, 'COC request not found', {
         code: 'COC_NOT_FOUND',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
+
+    if (user.role === 'applicant' && Number(cocResult.rows[0].applicant_id) !== Number(user.userId)) {
+      return sendError(res, 403, 'Access denied for this COC request', {
+        code: 'AUTH_FORBIDDEN',
         path: req.originalUrl,
         method: req.method,
       });
@@ -492,6 +604,14 @@ exports.addDeclaration = async (req, res) => {
 exports.addViolation = async (req, res) => {
   const client = await pool.connect();
   try {
+    if (!['technical_officer', 'admin'].includes(req.user?.role)) {
+      return sendError(res, 403, 'Only technical officer or admin can record violations', {
+        code: 'AUTH_FORBIDDEN',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
+
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
       return sendError(res, 400, 'Validation failed', {
@@ -514,11 +634,21 @@ exports.addViolation = async (req, res) => {
 
     await client.query('BEGIN');
 
-    const cocResult = await client.query('SELECT id FROM coc_requests WHERE id = $1', [id]);
+    const cocResult = await client.query('SELECT id, status FROM coc_requests WHERE id = $1 FOR UPDATE', [id]);
     if (!cocResult.rows.length) {
       await client.query('ROLLBACK');
       return sendError(res, 404, 'COC request not found', {
         code: 'COC_NOT_FOUND',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
+
+    if (!COC_VIOLATION_ALLOWED_STATUSES.includes(cocResult.rows[0].status)) {
+      await client.query('ROLLBACK');
+      return sendError(res, 400, 'Violation can only be recorded after inspection workflow states', {
+        code: 'COC_INVALID_STATUS',
+        details: { currentStatus: cocResult.rows[0].status },
         path: req.originalUrl,
         method: req.method,
       });
@@ -574,6 +704,14 @@ exports.addViolation = async (req, res) => {
 exports.addReinspection = async (req, res) => {
   const client = await pool.connect();
   try {
+    if (!['technical_officer', 'admin'].includes(req.user?.role)) {
+      return sendError(res, 403, 'Only technical officer or admin can record reinspections', {
+        code: 'AUTH_FORBIDDEN',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
+
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
       return sendError(res, 400, 'Validation failed', {
@@ -589,11 +727,21 @@ exports.addReinspection = async (req, res) => {
 
     await client.query('BEGIN');
 
-    const cocResult = await client.query('SELECT id FROM coc_requests WHERE id = $1', [id]);
+    const cocResult = await client.query('SELECT id, status FROM coc_requests WHERE id = $1 FOR UPDATE', [id]);
     if (!cocResult.rows.length) {
       await client.query('ROLLBACK');
       return sendError(res, 404, 'COC request not found', {
         code: 'COC_NOT_FOUND',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
+
+    if (!COC_REINSPECTION_ALLOWED_STATUSES.includes(cocResult.rows[0].status)) {
+      await client.query('ROLLBACK');
+      return sendError(res, 400, 'Reinspection updates are not allowed in the current COC status', {
+        code: 'COC_INVALID_STATUS',
+        details: { currentStatus: cocResult.rows[0].status },
         path: req.originalUrl,
         method: req.method,
       });
@@ -631,14 +779,20 @@ exports.addReinspection = async (req, res) => {
       [id, nextRound, result, req.user.userId, notes || null]
     );
 
+    const nextCocStatus = result === 'pending'
+      ? 'reinspection-requested'
+      : result === 'compliant'
+        ? 'inspection-complete'
+        : 'coc-violations-found';
+
     await client.query(
       `UPDATE coc_requests
        SET reinspection_rounds = $1,
            reinspection_requested_at = COALESCE(reinspection_requested_at, NOW()),
            reinspection_completed_at = CASE WHEN $2 = 'pending' THEN reinspection_completed_at ELSE NOW() END,
-           status = CASE WHEN $2 = 'compliant' THEN 'compliant' WHEN $2 = 'deviation' THEN 'deviation' ELSE 'reinspection-requested' END
+           status = $4
        WHERE id = $3`,
-      [nextRound, result, id]
+      [nextRound, result, id, nextCocStatus]
     );
 
     await client.query('COMMIT');
@@ -681,6 +835,14 @@ exports.submitApplicantPayment = async (req, res) => {
     const { id } = req.params;
     const { amount, payment_method = 'online', transaction_id, paid_at } = req.body;
     const user = req.user;
+
+    if (!['applicant', 'admin'].includes(user?.role)) {
+      return sendError(res, 403, 'Only applicant or admin can submit COC payments', {
+        code: 'AUTH_FORBIDDEN',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
 
     await client.query('BEGIN');
 
@@ -726,6 +888,15 @@ exports.submitApplicantPayment = async (req, res) => {
     const transactionId = transaction_id || `COC-${id}-${Date.now()}`;
 
     const isFineFlow = coc.status === 'coc-violations-found' || coc.status === 'coc-fine-paid-regularization-pending';
+    if (!COC_PAYMENT_ALLOWED_STATUSES.includes(coc.status)) {
+      await client.query('ROLLBACK');
+      return sendError(res, 400, 'Payments are not allowed in the current COC status', {
+        code: 'COC_INVALID_STATUS',
+        details: { currentStatus: coc.status },
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
     const isFixable = coc.violation_report && Object.prototype.hasOwnProperty.call(coc.violation_report, 'isFixable')
       ? !!coc.violation_report.isFixable
       : true;
@@ -807,6 +978,14 @@ exports.submitCorrectionEvidence = async (req, res) => {
     const { id } = req.params;
     const { evidence_note } = req.body;
     const user = req.user;
+
+    if (!['applicant', 'admin'].includes(user?.role)) {
+      return sendError(res, 403, 'Only applicant or admin can submit correction evidence', {
+        code: 'AUTH_FORBIDDEN',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
 
     await client.query('BEGIN');
 
@@ -891,6 +1070,14 @@ exports.requestApplicantReinspection = async (req, res) => {
 
     const { id } = req.params;
     const user = req.user;
+
+    if (!['applicant', 'admin'].includes(user?.role)) {
+      return sendError(res, 403, 'Only applicant or admin can request reinspection', {
+        code: 'AUTH_FORBIDDEN',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
 
     await client.query('BEGIN');
 

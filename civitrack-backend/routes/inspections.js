@@ -10,24 +10,32 @@ const router = express.Router();
 router.get(
   '/my',
   authMiddleware,
-  requireRole(['technical_officer', 'superintendent', 'admin']),
+  requireRole(['technical_officer', 'admin']),
   inspectionController.getMyInspections
 );
 
 router.post(
   '/application/:applicationId/schedule',
   authMiddleware,
-  requireRole(['technical_officer', 'superintendent', 'admin']),
+  requireRole(['technical_officer', 'admin']),
   param('applicationId').isInt({ min: 1 }).withMessage('Valid application id is required'),
   body('scheduled_date').isISO8601().withMessage('scheduled_date must be a valid ISO date time'),
   validateRequest,
   inspectionController.scheduleInspectionForApplication
 );
 
+const { upload, enforceMagicByteValidation } = require('../controllers/documentController');
+
 router.post(
   '/application/:applicationId/report',
   authMiddleware,
-  requireRole(['technical_officer', 'superintendent', 'admin']),
+  requireRole(['technical_officer', 'admin']),
+  upload.fields([
+    { name: 'report', maxCount: 1 },
+    { name: 'photos', maxCount: 10 },
+    { name: 'files', maxCount: 10 },
+  ]),
+  enforceMagicByteValidation,
   param('applicationId').isInt({ min: 1 }).withMessage('Valid application id is required'),
   body('recommendation').isIn(['approve', 'conditional', 'reject', 'not-granted']).withMessage('Invalid recommendation'),
   body('observations').optional().isString(),
@@ -39,7 +47,7 @@ router.post(
 router.post(
   '/application/:applicationId/hold',
   authMiddleware,
-  requireRole(['technical_officer', 'superintendent', 'admin']),
+  requireRole(['technical_officer', 'admin']),
   param('applicationId').isInt({ min: 1 }).withMessage('Valid application id is required'),
   body('hold_type').isIn(['complaint', 'clearance', 'technical-deficiency']).withMessage('Invalid hold_type'),
   body('reason').trim().isLength({ min: 3 }).withMessage('Reason is required'),
@@ -51,7 +59,7 @@ router.post(
 router.post(
   '/application/:applicationId/resolve-hold',
   authMiddleware,
-  requireRole(['technical_officer', 'superintendent', 'admin']),
+  requireRole(['technical_officer', 'admin']),
   param('applicationId').isInt({ min: 1 }).withMessage('Valid application id is required'),
   body('resolution_note').trim().isLength({ min: 3 }).withMessage('resolution_note is required'),
   validateRequest,
@@ -61,7 +69,7 @@ router.post(
 router.post(
   '/application/:applicationId/decline-assignment',
   authMiddleware,
-  requireRole(['technical_officer', 'superintendent', 'admin']),
+  requireRole(['technical_officer', 'admin']),
   param('applicationId').isInt({ min: 1 }).withMessage('Valid application id is required'),
   body('reason').trim().isLength({ min: 3 }).withMessage('reason is required'),
   validateRequest,

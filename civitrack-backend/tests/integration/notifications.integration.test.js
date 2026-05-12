@@ -86,7 +86,7 @@ describe('notifications integration', () => {
     });
   });
 
-  test('POST /api/notifications/send-to-sw returns standardized 500 when email service returns failure', async () => {
+  test('POST /api/notifications/send-to-sw is non-blocking when email service fails', async () => {
     const app = loadAppWithMocks({
       sendApplicationToSWNotification: jest.fn(async () => ({
         success: false,
@@ -105,14 +105,11 @@ describe('notifications integration', () => {
         recommendation: 'approve',
       });
 
-    expect(response.status).toBe(500);
+    expect(response.status).toBe(202);
     expect(response.body).toEqual(
       expect.objectContaining({
         success: false,
-        error: expect.objectContaining({
-          code: 'NOTIFICATION_SEND_FAILED',
-          message: 'Failed to send notification',
-        }),
+        code: 'NOTIFICATION_SEND_FAILED_NON_BLOCKING',
       })
     );
   });

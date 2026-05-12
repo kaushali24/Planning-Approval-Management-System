@@ -25,9 +25,13 @@ const {
   buildOrderByClause,
   buildPaginationClause,
 } = require('../utils/queryBuilder');
+const { assertNoActiveHold } = require('../utils/holdGate');
+const { applyStatusTransition } = require('../utils/applicationStatusUpdater');
 
 const STAFF_ROLES = ['planning_officer', 'technical_officer', 'superintendent', 'committee', 'admin'];
 const getChangedByStaffId = (user) => (STAFF_ROLES.includes(user.role) ? user.userId : null);
+const SUBMISSION_FEE_ACCEPTED_PAYMENT_STATUSES = ['processing', 'submitted', 'completed'];
+const ASSIGNABLE_TECHNICAL_OFFICER_ROLES = ['technical_officer'];
 
 const DEFAULT_DOCUMENT_CHECKLIST = [
   { key: 'deed', required: true, active: true },
@@ -176,6 +180,49 @@ const cleanupUploadedFiles = (files) => {
   }
 };
 
+const hasRecordedSubmissionFee = async (dbClient, applicationId) => {
+  const result = await dbClient.query(
+    `SELECT 1
+     FROM payments
+     WHERE application_id = $1
+       AND payment_type = 'application_fee'
+       AND status = ANY($2::text[])
+     ORDER BY created_at DESC, id DESC
+     LIMIT 1`,
+    [applicationId, SUBMISSION_FEE_ACCEPTED_PAYMENT_STATUSES]
+  );
+  return result.rows.length > 0;
+};
+
+const resolveAssignableTechnicalOfficer = async (dbClient, assignedToValue) => {
+  let staffResult = null;
+  if (/^\d+$/.test(assignedToValue)) {
+    staffResult = await dbClient.query(
+      `SELECT id, full_name
+       FROM staff_accounts
+       WHERE id = $1
+         AND role = ANY($2::text[])
+         AND COALESCE(is_active, true) = true`,
+      [Number.parseInt(assignedToValue, 10), ASSIGNABLE_TECHNICAL_OFFICER_ROLES]
+    );
+  }
+
+  if (!staffResult || !staffResult.rows.length) {
+    staffResult = await dbClient.query(
+      `SELECT id, full_name
+       FROM staff_accounts
+       WHERE (staff_id = $1 OR LOWER(full_name) = LOWER($1))
+         AND role = ANY($2::text[])
+         AND COALESCE(is_active, true) = true
+       ORDER BY id ASC
+       LIMIT 1`,
+      [assignedToValue, ASSIGNABLE_TECHNICAL_OFFICER_ROLES]
+    );
+  }
+
+  return staffResult.rows[0] || null;
+};
+
 /**
  * Create a new application
  * POST /api/applications
@@ -204,7 +251,6 @@ exports.createApplication = async (req, res) => {
       latitude,
       longitude,
       declaration_accepted,
-      status,
     } = req.body;
 
     const normalizedName = normalizeString(submitted_applicant_name);
@@ -214,7 +260,7 @@ exports.createApplication = async (req, res) => {
     const normalizedContact = normalizeString(req.body.submitted_contact) || 'N/A';
 
     // Verify applicant exists
-    const applicantCheck = await pool.query(
+    const applicantCheck = await client.query(
       'SELECT id FROM applicants WHERE id = $1',
       [user.userId]
     );
@@ -252,7 +298,7 @@ exports.createApplication = async (req, res) => {
         latitude || null,
         longitude || null,
         declaration_accepted === true,
-        status || 'submitted'
+        'submitted'
       ]
     );
 
@@ -313,7 +359,16 @@ exports.getApplications = async (req, res) => {
     }
 
     const offset = (page - 1) * limit;
-    let baseFrom = ' FROM applications a ';
+    let baseFrom = `
+      FROM applications a
+      LEFT JOIN LATERAL (
+        SELECT ash.status, ash.changed_at
+        FROM application_status_history ash
+        WHERE ash.application_id = a.id
+        ORDER BY ash.changed_at DESC, ash.id DESC
+        LIMIT 1
+      ) latest_status_history ON TRUE
+    `;
     let params = [];
     let conditions = [];
 
@@ -325,7 +380,7 @@ exports.getApplications = async (req, res) => {
     } else if (user.accountType === 'staff' || user.role === 'staff' || STAFF_ROLES.includes(user.role)) {
       // Staff can see assigned applications + all non-draft (for PO/Admin/Superintendent)
       if (user.role === 'planning_officer' || user.role === 'superintendent' || user.role === 'admin') {
-        conditions.push(`a.status != 'draft'`);
+        conditions.push(`COALESCE(latest_status_history.status, a.status) != 'draft'`);
       } else {
         // Technical Officers only see assigned + new submissions
         conditions.push(`(
@@ -336,7 +391,7 @@ exports.getApplications = async (req, res) => {
               AND aa.assigned_to = $${params.length + 1}
               AND aa.status IN ('pending', 'accepted', 'in_progress')
           )
-          OR a.status IN ('submitted', 'under_review')
+          OR COALESCE(latest_status_history.status, a.status) IN ('submitted', 'under_review')
         )`);
         params.push(user.userId);
       }
@@ -371,7 +426,9 @@ exports.getApplications = async (req, res) => {
     // Build and execute main data query
     const dataQuery = `
       SELECT
-        a.id, a.application_code, a.applicant_id, a.application_type, a.status,
+        a.id, a.application_code, a.applicant_id, a.application_type,
+        COALESCE(latest_status_history.status, a.status) as status,
+        a.status as stored_status,
         a.submission_date, a.last_updated, a.submitted_applicant_name, 
         a.submitted_email, a.submitted_address,
         a.assessment_number, a.deed_number, a.survey_plan_ref, a.land_extent,
@@ -568,6 +625,24 @@ exports.updateApplicationStatus = async (req, res) => {
     }
 
     const currentStatus = appResult.rows[0].status;
+
+    try {
+      await assertNoActiveHold({
+        client,
+        applicationId,
+        userRole: user.role,
+        currentStatus,
+        requestedStatus: status,
+      });
+    } catch (e) {
+      if (e?.httpStatus === 409 && e?.payload?.code === 'APPLICATION_ON_HOLD') {
+        await client.query('ROLLBACK');
+        transactionStarted = false;
+        return res.status(409).json(e.payload);
+      }
+      throw e;
+    }
+
     const transitionCheck = validateApplicationStatusTransition({
       fromStatus: currentStatus,
       toStatus: status,
@@ -593,21 +668,15 @@ exports.updateApplicationStatus = async (req, res) => {
       });
     }
 
-    // Update application status
-    const updateResult = await client.query(
-      `UPDATE applications 
-       SET status = $1, last_updated = NOW() 
-       WHERE id = $2 
-       RETURNING *`,
-      [status, applicationId]
-    );
-
-    // Record in status history
-    await client.query(
-      `INSERT INTO application_status_history (application_id, status, changed_at, changed_by, reason, source_stage)
-       VALUES ($1, $2, NOW(), $3, $4, $5)`,
-      [applicationId, status, user.userId, notes || null, `${currentStatus}->${status}`]
-    );
+    const updatedApplication = await applyStatusTransition({
+      client,
+      applicationId,
+      toStatus: status,
+      changedBy: user.userId,
+      reason: notes || null,
+      sourceStage: `${currentStatus}->${status}`,
+      returnApplication: true,
+    });
 
     // Synchronize with application_assignments record for assignments/acceptance workflow
     if (status === 'accepted') {
@@ -624,7 +693,7 @@ exports.updateApplicationStatus = async (req, res) => {
 
     res.json({
       message: 'Application status updated successfully',
-      application: updateResult.rows[0],
+      application: updatedApplication,
     });
   } catch (error) {
     if (client && transactionStarted) {
@@ -644,7 +713,6 @@ exports.updateApplicationStatus = async (req, res) => {
  * PATCH /api/applications/:id
  */
 exports.updateApplication = async (req, res) => {
-  const client = await pool.connect();
   try {
     const { id } = req.params;
     const submittedApplicantName = normalizeString(req.body.submitted_applicant_name);
@@ -689,9 +757,8 @@ exports.assignApplication = async (req, res) => {
       return res.status(400).json({ error: 'Staff member is required for assignment' });
     }
 
-    // Verify application exists
     const appResult = await pool.query(
-      'SELECT id FROM applications WHERE id = $1',
+      'SELECT id, status FROM applications WHERE id = $1',
       [id]
     );
 
@@ -699,40 +766,42 @@ exports.assignApplication = async (req, res) => {
       return res.status(404).json({ error: 'Application not found' });
     }
 
-    let staffResult = null;
-    if (/^\d+$/.test(assignedToValue)) {
-      staffResult = await pool.query(
-        'SELECT id, full_name FROM staff_accounts WHERE id = $1',
-        [Number.parseInt(assignedToValue, 10)]
-      );
+    const assignStatus = appResult.rows[0].status;
+    if (assignStatus !== 'under_review') {
+      return res.status(400).json({
+        error: 'Application must be under technical review (under_review) before assigning a Technical Officer',
+        code: 'INVALID_STATUS_FOR_ASSIGNMENT',
+        currentStatus: assignStatus,
+      });
     }
 
-    if (!staffResult || !staffResult.rows.length) {
-      staffResult = await pool.query(
-        `SELECT id, full_name
-         FROM staff_accounts
-         WHERE staff_id = $1 OR LOWER(full_name) = LOWER($1)
-         ORDER BY id ASC
-         LIMIT 1`,
-        [assignedToValue]
-      );
+    const staff = await resolveAssignableTechnicalOfficer(pool, assignedToValue);
+    if (!staff) {
+      return res.status(404).json({ error: 'Active technical officer not found' });
     }
 
-    if (!staffResult.rows.length) {
-      return res.status(404).json({ error: 'Staff member not found' });
-    }
-
-    const assignedToId = staffResult.rows[0].id;
+    const assignedToId = staff.id;
     const assignmentNotes = normalizeString(notes) || null;
 
     // Check for existing active assignment
     const existingAssignment = await pool.query(
-      `SELECT id FROM application_assignments 
+      `SELECT id, assigned_to FROM application_assignments 
        WHERE application_id = $1 AND status IN ('pending', 'accepted', 'in_progress')`,
       [id]
     );
 
     if (existingAssignment.rows.length) {
+      const currentAssignedTo = Number(existingAssignment.rows[0].assigned_to);
+      const isReassignment = Number(assignedToId) !== currentAssignedTo;
+      if (isReassignment && (!assignmentNotes || assignmentNotes.length < 5)) {
+        return res.status(400).json({
+          error: 'Reassignment requires notes with at least 5 characters',
+          code: 'REASSIGNMENT_NOTE_REQUIRED',
+          currentAssignedTo: currentAssignedTo || null,
+          requestedAssignedTo: assignedToId,
+        });
+      }
+
       // Update existing
       await pool.query(
         `UPDATE application_assignments 
@@ -761,7 +830,7 @@ exports.assignApplication = async (req, res) => {
     res.json({
       message: 'Application assigned successfully',
       assignedTo: assignedToId,
-      assignedToName: staffResult.rows[0].full_name,
+      assignedToName: staff.full_name,
     });
   } catch (error) {
     console.error('Assign application error:', error);
@@ -776,6 +845,17 @@ exports.assignApplication = async (req, res) => {
 exports.getApplicationAssignments = async (req, res) => {
   try {
     const { id } = req.params;
+    const user = req.user;
+
+    if (user?.role === 'applicant' || user?.accountType === 'applicant') {
+      const ownership = await pool.query(
+        'SELECT id FROM applications WHERE id = $1 AND applicant_id = $2',
+        [id, user.userId]
+      );
+      if (!ownership.rows.length) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+    }
 
     const result = await pool.query(
       `SELECT 
@@ -882,24 +962,32 @@ exports.getApplicationStats = async (req, res) => {
  */
 exports.saveDraft = async (req, res) => {
   let client;
+  let transactionStarted = false;
   try {
     client = await pool.connect();
     const { id } = req.params;
     const user = req.user;
 
+    await client.query('BEGIN');
+    transactionStarted = true;
+
     // Verify application exists and is in draft status
-    const appResult = await pool.query(
-      'SELECT * FROM applications WHERE id = $1 AND applicant_id = $2',
+    const appResult = await client.query(
+      'SELECT * FROM applications WHERE id = $1 AND applicant_id = $2 FOR UPDATE',
       [id, user.userId]
     );
 
     if (!appResult.rows.length) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
       return res.status(404).json({ error: 'Draft not found' });
     }
 
     const app = appResult.rows[0];
 
     if (app.status !== 'draft') {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
       return res.status(400).json({ error: 'Only draft applications can be updated' });
     }
 
@@ -1001,10 +1089,10 @@ exports.saveDraft = async (req, res) => {
     const selectedPermitCodes = selectedPermitCodesProvided ? parseSelectedPermitCodes(selected_permit_codes) : null;
 
     if (updateFields.length === 0 && !selectedPermitCodesProvided) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
       return res.status(400).json({ error: 'No fields provided to update' });
     }
-
-    await client.query('BEGIN');
 
     // Always update last_updated
     updateFields.push(`last_updated = NOW()`);
@@ -1025,6 +1113,7 @@ exports.saveDraft = async (req, res) => {
     }
 
     await client.query('COMMIT');
+    transactionStarted = false;
 
     res.json({
       message: 'Draft saved successfully',
@@ -1038,7 +1127,7 @@ exports.saveDraft = async (req, res) => {
       },
     });
   } catch (error) {
-    if (client) {
+    if (client && transactionStarted) {
       await client.query('ROLLBACK');
     }
     console.error('Save draft error:', error);
@@ -1164,6 +1253,7 @@ exports.clearDraft = async (req, res) => {
  * Requires full validation - all mandatory fields must be present
  */
 exports.submitDraft = async (req, res) => {
+  const client = await pool.connect();
   try {
     const { id } = req.params;
     const user = req.user;
@@ -1174,13 +1264,28 @@ exports.submitDraft = async (req, res) => {
     }
 
     // Verify draft exists
-    const appResult = await pool.query(
-      'SELECT * FROM applications WHERE id = $1 AND applicant_id = $2 AND status = $3',
+    await client.query('BEGIN');
+
+    const appResult = await client.query(
+      `SELECT *
+       FROM applications
+       WHERE id = $1 AND applicant_id = $2 AND status = $3
+       FOR UPDATE`,
       [id, user.userId, 'draft']
     );
 
     if (!appResult.rows.length) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Draft not found' });
+    }
+
+    const feeRecorded = await hasRecordedSubmissionFee(client, id);
+    if (!feeRecorded) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'Application fee payment proof must be recorded before submission.',
+        code: 'FEE_REQUIRED_BEFORE_SUBMISSION',
+      });
     }
 
     // NOTE: Strict document type pre-check is removed here because the frontend 
@@ -1226,7 +1331,7 @@ exports.submitDraft = async (req, res) => {
     const normalizedContact = normalizeString(submitted_contact) || 'N/A';
 
     // Update draft to submitted status
-    const result = await pool.query(
+    const result = await client.query(
       `UPDATE applications 
        SET status = 'submitted',
            application_type = $1,
@@ -1250,19 +1355,24 @@ exports.submitDraft = async (req, res) => {
     );
 
     // Record submission in status history
-    await pool.query(
+    await client.query(
       `INSERT INTO application_status_history (application_id, status, changed_at, changed_by)
        VALUES ($1, 'submitted', NOW(), $2)`,
       [id, user.userId]
     );
+
+    await client.query('COMMIT');
 
     res.json({
       message: 'Application submitted successfully',
       application: result.rows[0],
     });
   } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('Submit draft error:', error);
     res.status(500).json({ error: 'Failed to submit application', details: error.message });
+  } finally {
+    client.release();
   }
 };
 
@@ -1271,6 +1381,7 @@ exports.submitDraft = async (req, res) => {
  * POST /api/applications/:id/documents
  */
 exports.uploadApplicationDocuments = async (req, res) => {
+  let client;
   let transactionStarted = false;
   const persistedFiles = [];
   try {
@@ -1281,7 +1392,9 @@ exports.uploadApplicationDocuments = async (req, res) => {
       return res.status(400).json({ error: 'No files provided' });
     }
 
-    const appResult = await pool.query(
+    client = await pool.connect();
+
+    const appResult = await client.query(
       `SELECT a.id, a.applicant_id, a.application_code, a.status, ap.applicant_ref_id
        FROM applications a
        JOIN applicants ap ON ap.id = a.applicant_id
@@ -1332,7 +1445,7 @@ exports.uploadApplicationDocuments = async (req, res) => {
       });
     }
 
-    await pool.query('BEGIN');
+    await client.query('BEGIN');
     transactionStarted = true;
 
     const uploadedDocuments = [];
@@ -1340,7 +1453,7 @@ exports.uploadApplicationDocuments = async (req, res) => {
     for (let index = 0; index < req.files.length; index += 1) {
       const file = req.files[index];
       const docType = docTypes[index];
-      const documentCategory = String(docType || '').trim().toLowerCase().replace(/\s+/g, '_') || 'document';
+      const documentCategory = String(docType || '').trim().toLowerCase().replace(/[\s-]+/g, '_') || 'document';
       const storageInfo = buildDocumentStorageInfo({
         applicantRefId: app.applicant_ref_id,
         applicationCode: app.application_code,
@@ -1351,7 +1464,7 @@ exports.uploadApplicationDocuments = async (req, res) => {
       await moveUploadedFile(file.path, storageInfo.absolutePath);
       persistedFiles.push({ path: storageInfo.absolutePath });
 
-      const inserted = await pool.query(
+      const inserted = await client.query(
         `INSERT INTO documents (
           application_id,
           applicant_ref_id,
@@ -1386,7 +1499,7 @@ exports.uploadApplicationDocuments = async (req, res) => {
       uploadedDocuments.push(inserted.rows[0]);
     }
 
-    await pool.query('COMMIT');
+    await client.query('COMMIT');
 
     const { allowedDocumentTypes, requiredDocumentTypes } = await getAllowedAndRequiredDocumentTypes();
 
@@ -1399,7 +1512,7 @@ exports.uploadApplicationDocuments = async (req, res) => {
     });
   } catch (error) {
     if (transactionStarted) {
-      await pool.query('ROLLBACK').catch((rollbackError) => {
+      await client.query('ROLLBACK').catch((rollbackError) => {
         console.error('Rollback error:', rollbackError);
       });
     }
@@ -1412,6 +1525,10 @@ exports.uploadApplicationDocuments = async (req, res) => {
     console.error('Upload application documents error:', error);
     if (res && !res.headersSent) {
       res.status(500).json({ error: 'Failed to upload documents', details: error.message });
+    }
+  } finally {
+    if (client) {
+      client.release();
     }
   }
 };
@@ -1491,6 +1608,7 @@ exports.resubmitCorrections = async (req, res) => {
 
     // 3. Process each file
     const uploadedDocs = [];
+    const oldFilesToDelete = [];
     for (let i = 0; i < req.files.length; i++) {
       const file = req.files[i];
       const targetDocId = resubmittedDocIds[i];
@@ -1498,7 +1616,34 @@ exports.resubmitCorrections = async (req, res) => {
       // Find the label from current deficient docs if possible
       const deficientDocInfo = currentDeficientDocs.find(d => String(d.id) === String(targetDocId));
       const docType = deficientDocInfo ? deficientDocInfo.label : 'correction_document';
-      const documentCategory = docType.trim().toLowerCase().replace(/\s+/g, '_');
+      const documentCategory = docType.trim().toLowerCase().replace(/[\s-]+/g, '_');
+
+      // Replace: delete the previous document(s) by ID if provided, or by category as fallback
+      if (deficientDocInfo && deficientDocInfo.backendId) {
+        const rowToDelete = await client.query(
+          'SELECT id, storage_key, stored_filename FROM documents WHERE id = $1',
+          [deficientDocInfo.backendId]
+        );
+        if (rowToDelete.rows.length > 0) {
+          const oldDoc = rowToDelete.rows[0];
+          await client.query('DELETE FROM documents WHERE id = $1', [oldDoc.id]);
+          const oldAbsolutePath = getDocumentFilePath(oldDoc);
+          if (oldAbsolutePath) oldFilesToDelete.push(oldAbsolutePath);
+        }
+      }
+
+      // Cleanup Fallback: delete any other previous documents matching this category for this application
+      const matchingDocs = await client.query(
+        `SELECT id, storage_key, stored_filename
+         FROM documents
+         WHERE application_id = $1 AND document_category = $2`,
+        [applicationId, documentCategory]
+      );
+      for (const oldDoc of matchingDocs.rows) {
+        await client.query('DELETE FROM documents WHERE id = $1', [oldDoc.id]);
+        const oldAbsolutePath = getDocumentFilePath(oldDoc);
+        if (oldAbsolutePath) oldFilesToDelete.push(oldAbsolutePath);
+      }
 
       const storageInfo = buildDocumentStorageInfo({
         applicantRefId: app.applicant_ref_id,
@@ -1537,27 +1682,38 @@ exports.resubmitCorrections = async (req, res) => {
 
     const updatedPrelimData = {
       ...currentPrelimData,
-      deficientDocuments: remainingDeficientDocs,
+      prelimStatus: 'pending',
+      deficientDocuments: [],
+      correctionResubmissions: {},
       lastCorrectionAt: new Date().toISOString(),
     };
 
-    // 5. Update application status to Stage 2 (submitted)
+    // 5. Update preliminary data and move back to submitted through shared status helper
     await client.query(
-      `UPDATE applications 
-       SET preliminary_check_data = $1, status = 'submitted', last_updated = NOW() 
+      `UPDATE applications
+       SET preliminary_check_data = $1
        WHERE id = $2`,
       [JSON.stringify(updatedPrelimData), applicationId]
     );
 
-    // 6. Record status history
-    await client.query(
-      `INSERT INTO application_status_history (application_id, status, changed_at, changed_by, reason)
-       VALUES ($1, 'submitted', NOW(), $2, $3)`,
-      [applicationId, user.userId, `Applicant resubmitted corrections for: ${resubmittedDocIds.join(', ')}`]
-    );
+    await applyStatusTransition({
+      client,
+      applicationId,
+      toStatus: 'submitted',
+      changedBy: user.userId,
+      reason: `Applicant resubmitted corrected documents for: ${resubmittedDocIds.join(', ')}`,
+      sourceStage: 'correction-resubmission',
+    });
 
     await client.query('COMMIT');
     transactionStarted = false;
+
+    // Clean up old replaced document files after successful commit (best-effort)
+    await Promise.all(
+      oldFilesToDelete.map((filePath) =>
+        removeFileIfExists(filePath).catch((e) => console.error('Old doc cleanup error:', e))
+      )
+    );
 
     res.status(200).json({
       message: 'Corrections resubmitted successfully. Application returned to Preliminary Examination.',
@@ -1577,6 +1733,131 @@ exports.resubmitCorrections = async (req, res) => {
     console.error('Resubmit corrections error:', error);
     if (res && !res.headersSent) {
       res.status(500).json({ error: 'Failed to resubmit corrections', details: error.message });
+    }
+  } finally {
+    if (client) client.release();
+  }
+};
+
+/**
+ * Submit response for an investigation hold (clearance or complaint)
+ * POST /api/applications/:id/investigation-response
+ */
+exports.submitInvestigationResponse = async (req, res) => {
+  let client;
+  let transactionStarted = false;
+  const persistedFiles = [];
+  try {
+    const applicationId = Number.parseInt(req.params.id, 10);
+    const user = req.user;
+    const { comment } = req.body;
+
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: 'At least one document is required for hold response' });
+    }
+
+    client = await pool.connect();
+    await client.query('BEGIN');
+    transactionStarted = true;
+
+    // Verify application ownership and status
+    const appResult = await client.query(
+      `SELECT a.id, a.application_code, a.applicant_id, ap.applicant_ref_id, a.status 
+       FROM applications a
+       JOIN applicants ap ON ap.id = a.applicant_id
+       WHERE a.id = $1 FOR UPDATE`,
+      [applicationId]
+    );
+
+    if (!appResult.rows.length) {
+      cleanupUploadedFiles(req.files);
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Application not found' });
+    }
+
+    const app = appResult.rows[0];
+    if (app.applicant_id !== user.userId) {
+      cleanupUploadedFiles(req.files);
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Check if on hold
+    const holdResult = await client.query(
+      `SELECT id, hold_type FROM application_holds 
+       WHERE application_id = $1 AND hold_status = 'active'
+       ORDER BY requested_at DESC LIMIT 1`,
+      [applicationId]
+    );
+
+    if (!holdResult.rows.length) {
+      cleanupUploadedFiles(req.files);
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'No active hold found for this application' });
+    }
+
+    const hold = holdResult.rows[0];
+    const uploadedDocs = [];
+
+    // Process files
+    for (const file of req.files) {
+      const documentCategory = hold.hold_type === 'clearance' ? 'clearance_document' : 'complaint_response';
+      const storageInfo = buildDocumentStorageInfo({
+        applicantRefId: app.applicant_ref_id,
+        applicationCode: app.application_code,
+        documentCategory,
+        filename: file.filename,
+      });
+
+      await moveUploadedFile(file.path, storageInfo.absolutePath);
+      persistedFiles.push({ path: storageInfo.absolutePath });
+
+      const inserted = await client.query(
+        `INSERT INTO documents (
+          application_id, applicant_ref_id, application_code, 
+          doc_type, document_category, original_filename, 
+          stored_filename, storage_key, file_url, mime_type, file_size
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        RETURNING id, doc_type, file_url`,
+        [
+          applicationId, app.applicant_ref_id, app.application_code,
+          documentCategory.replace('_', ' '), documentCategory, file.originalname,
+          file.filename, storageInfo.relativePath, storageInfo.relativePath,
+          file.mimetype, file.size
+        ]
+      );
+      uploadedDocs.push(inserted.rows[0]);
+    }
+
+    // Record response in status history/audit
+    await client.query(
+      `INSERT INTO application_status_history (application_id, status, changed_at, changed_by, reason)
+       VALUES ($1, $2, NOW(), $3, $4)`,
+      [applicationId, app.status, user.userId, `Applicant submitted investigation response: ${comment || 'No comment provided'}`]
+    );
+
+    // Update hold record with response note
+    await client.query(
+        `UPDATE application_holds SET resolution_note = COALESCE(resolution_note, '') || '\n[APPLICANT RESPONSE]: ' || $1
+         WHERE id = $2`,
+        [comment || 'Documents submitted', hold.id]
+    );
+
+    await client.query('COMMIT');
+    transactionStarted = false;
+
+    res.status(200).json({
+      message: 'Investigation response submitted successfully. Awaiting review by the Technical Officer.',
+      uploadedCount: uploadedDocs.length
+    });
+
+  } catch (error) {
+    if (transactionStarted && client) await client.query('ROLLBACK').catch(e => console.error('Rollback error:', e));
+    cleanupUploadedFiles(req.files);
+    console.error('Submit investigation response error:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to submit response', details: error.message });
     }
   } finally {
     if (client) client.release();
@@ -1636,6 +1917,7 @@ exports.getApplicationDocuments = async (req, res) => {
  * DELETE /api/applications/:applicationId/documents/:documentId
  */
 exports.deleteApplicationDocument = async (req, res) => {
+  let client;
   let transactionStarted = false;
   try {
     const { applicationId, documentId } = req.params;
@@ -1658,10 +1940,11 @@ exports.deleteApplicationDocument = async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    await pool.query('BEGIN');
+    client = await pool.connect();
+    await client.query('BEGIN');
     transactionStarted = true;
-    await pool.query('DELETE FROM documents WHERE id = $1', [documentId]);
-    await pool.query('COMMIT');
+    await client.query('DELETE FROM documents WHERE id = $1', [documentId]);
+    await client.query('COMMIT');
 
     // Clean up file after successful db delete
     const absolutePath = getDocumentFilePath(document);
@@ -1669,13 +1952,17 @@ exports.deleteApplicationDocument = async (req, res) => {
 
     return res.json({ message: 'Document deleted successfully' });
   } catch (error) {
-    if (transactionStarted) {
-      await pool.query('ROLLBACK').catch((rollbackError) => {
+    if (transactionStarted && client) {
+      await client.query('ROLLBACK').catch((rollbackError) => {
         console.error('Rollback error:', rollbackError);
       });
     }
     console.error('Delete application document error:', error);
     return res.status(500).json({ error: 'Failed to delete document', details: error.message });
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 };
 
@@ -1698,7 +1985,7 @@ exports.submitApplicationPaymentProof = async (req, res) => {
     await client.query('BEGIN');
 
     const appResult = await client.query(
-      `SELECT id, applicant_id
+      `SELECT id, applicant_id, status
        FROM applications
        WHERE id = $1
        FOR UPDATE`,
@@ -1734,33 +2021,62 @@ exports.submitApplicationPaymentProof = async (req, res) => {
       return res.status(400).json({ error: 'submitted_at must be a valid date time' });
     }
 
-    const paymentResult = await client.query(
-      `INSERT INTO payments (
-        application_id,
-        payment_type,
-        amount,
-        status,
-        transaction_id,
-        payment_method,
-        paid_at
-      )
-      VALUES ($1, 'application_fee', $2, 'processing', $3, $4, $5)
-      RETURNING *`,
-      [applicationId, normalizedAmount, normalizedReference, normalizedMethod, paidAt.toISOString()]
-    );
-
-    await client.query(
-      `INSERT INTO application_status_history (application_id, status, changed_at, changed_by, reason, source_stage)
-       VALUES ($1, 'payment_pending', NOW(), $2, $3, 'payment-proof-submitted')`,
-      [applicationId, getChangedByStaffId(user), `Offline payment proof submitted via ${normalizedMethod}`]
-    );
-
-    await client.query(
-      `UPDATE applications
-       SET last_updated = NOW()
-       WHERE id = $1`,
+    const expectedFeeResult = await client.query(
+      `SELECT id, amount, status
+       FROM payments
+       WHERE application_id = $1
+         AND payment_type = 'application_fee'
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1
+       FOR UPDATE`,
       [applicationId]
     );
+
+    if (!expectedFeeResult.rows.length || expectedFeeResult.rows[0].status !== 'pending') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'Inspection fee request is missing or already submitted',
+        code: 'PAYMENT_REQUEST_NOT_PENDING',
+      });
+    }
+
+    const expectedAmount = Number.parseFloat(expectedFeeResult.rows[0].amount);
+    if (Number.isFinite(expectedAmount) && Math.abs(expectedAmount - normalizedAmount) > 0.01) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: `Submitted amount ${normalizedAmount} does not match requested fee ${expectedAmount}`,
+        code: 'PAYMENT_AMOUNT_MISMATCH',
+      });
+    }
+
+    const paymentResult = await client.query(
+      `UPDATE payments
+       SET status = 'processing',
+           transaction_id = $1,
+           payment_method = $2,
+           paid_at = $3
+       WHERE id = $4
+       RETURNING *`,
+      [normalizedReference, normalizedMethod, paidAt.toISOString(), expectedFeeResult.rows[0].id]
+    );
+
+    if (appResult.rows[0].status !== 'payment_pending') {
+      await applyStatusTransition({
+        client,
+        applicationId,
+        toStatus: 'payment_pending',
+        changedBy: getChangedByStaffId(user),
+        reason: `Offline payment proof submitted via ${normalizedMethod}`,
+        sourceStage: 'payment-proof-submitted',
+      });
+    } else {
+      await client.query(
+        `UPDATE applications
+         SET last_updated = NOW()
+         WHERE id = $1`,
+        [applicationId]
+      );
+    }
 
     await client.query('COMMIT');
 
@@ -1796,7 +2112,7 @@ exports.recordApplicationOnlinePayment = async (req, res) => {
     await client.query('BEGIN');
 
     const appResult = await client.query(
-      `SELECT id, applicant_id
+      `SELECT id, applicant_id, status
        FROM applications
        WHERE id = $1
        FOR UPDATE`,
@@ -1826,33 +2142,62 @@ exports.recordApplicationOnlinePayment = async (req, res) => {
       return res.status(400).json({ error: 'paid_at must be a valid date time' });
     }
 
-    const paymentResult = await client.query(
-      `INSERT INTO payments (
-        application_id,
-        payment_type,
-        amount,
-        status,
-        transaction_id,
-        payment_method,
-        paid_at
-      )
-      VALUES ($1, 'application_fee', $2, 'completed', $3, 'online', $4)
-      RETURNING *`,
-      [applicationId, normalizedAmount, normalizedTransactionId, paidAt.toISOString()]
-    );
-
-    await client.query(
-      `INSERT INTO application_status_history (application_id, status, changed_at, changed_by, reason, source_stage)
-       VALUES ($1, 'payment_pending', NOW(), $2, $3, 'payment-online-completed')`,
-      [applicationId, getChangedByStaffId(user), 'Online application fee payment completed']
-    );
-
-    await client.query(
-      `UPDATE applications
-       SET last_updated = NOW()
-       WHERE id = $1`,
+    const expectedFeeResult = await client.query(
+      `SELECT id, amount, status
+       FROM payments
+       WHERE application_id = $1
+         AND payment_type = 'application_fee'
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1
+       FOR UPDATE`,
       [applicationId]
     );
+
+    if (!expectedFeeResult.rows.length || expectedFeeResult.rows[0].status !== 'pending') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'Inspection fee request is missing or already submitted',
+        code: 'PAYMENT_REQUEST_NOT_PENDING',
+      });
+    }
+
+    const expectedAmount = Number.parseFloat(expectedFeeResult.rows[0].amount);
+    if (Number.isFinite(expectedAmount) && Math.abs(expectedAmount - normalizedAmount) > 0.01) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: `Paid amount ${normalizedAmount} does not match requested fee ${expectedAmount}`,
+        code: 'PAYMENT_AMOUNT_MISMATCH',
+      });
+    }
+
+    const paymentResult = await client.query(
+      `UPDATE payments
+       SET status = 'submitted',
+           transaction_id = $1,
+           payment_method = 'online',
+           paid_at = $2
+       WHERE id = $3
+       RETURNING *`,
+      [normalizedTransactionId, paidAt.toISOString(), expectedFeeResult.rows[0].id]
+    );
+
+    if (appResult.rows[0].status !== 'payment_pending') {
+      await applyStatusTransition({
+        client,
+        applicationId,
+        toStatus: 'payment_pending',
+        changedBy: getChangedByStaffId(user),
+        reason: 'Online application fee payment submitted',
+        sourceStage: 'payment-online-submitted',
+      });
+    } else {
+      await client.query(
+        `UPDATE applications
+         SET last_updated = NOW()
+         WHERE id = $1`,
+        [applicationId]
+      );
+    }
 
     await client.query('COMMIT');
 
@@ -1906,12 +2251,41 @@ exports.recordPreliminaryCheck = async (req, res) => {
     const currentStatus = appResult.rows[0].status;
     let newStatus = currentStatus;
 
+    const prelimFinalizeAllowed = new Set(['submitted', 'under_review', 'correction', 'pending']);
+    if (isDraft === false && !prelimFinalizeAllowed.has(currentStatus)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'Preliminary check can only be finalized for applications in submitted, under_review, correction, or pending status',
+        code: 'INVALID_STATUS_FOR_PRELIMINARY',
+        currentStatus,
+      });
+    }
+
     // Determine new status if not a draft
     if (isDraft === false) {
       if (deficientDocuments && deficientDocuments.length > 0) {
         newStatus = 'correction';
       } else {
         newStatus = 'verified';
+      }
+    }
+
+    // Hold gate: allow draft edits that do not change status, but block finalization/status changes while held.
+    if (newStatus !== currentStatus) {
+      try {
+        await assertNoActiveHold({
+          client,
+          applicationId,
+          userRole: user.role,
+          currentStatus,
+          requestedStatus: newStatus,
+        });
+      } catch (e) {
+        if (e?.httpStatus === 409 && e?.payload?.code === 'APPLICATION_ON_HOLD') {
+          await client.query('ROLLBACK');
+          return res.status(409).json(e.payload);
+        }
+        throw e;
       }
     }
 
@@ -1926,21 +2300,22 @@ exports.recordPreliminaryCheck = async (req, res) => {
     };
 
     await client.query(
-      `UPDATE applications 
+      `UPDATE applications
        SET preliminary_check_data = $1,
-           status = $2,
            last_updated = NOW()
-       WHERE id = $3`,
-      [JSON.stringify(preliminaryCheckData), newStatus, applicationId]
+       WHERE id = $2`,
+      [JSON.stringify(preliminaryCheckData), applicationId]
     );
 
     // Record status history if changed
     if (newStatus !== currentStatus) {
-      await client.query(
-        `INSERT INTO application_status_history (application_id, status, changed_at, changed_by, reason)
-         VALUES ($1, $2, NOW(), $3, $4)`,
-        [applicationId, newStatus, getChangedByStaffId(user), isDraft ? 'Draft progress saved' : (newStatus === 'verified' ? 'Preliminary verification completed' : 'Corrections requested')]
-      );
+      await applyStatusTransition({
+        client,
+        applicationId,
+        toStatus: newStatus,
+        changedBy: getChangedByStaffId(user),
+        reason: isDraft ? 'Draft progress saved' : (newStatus === 'verified' ? 'Preliminary verification completed' : 'Corrections requested'),
+      });
     }
 
     await client.query('COMMIT');
@@ -1974,6 +2349,7 @@ exports.recordPreliminaryCheck = async (req, res) => {
  * Returns: { successCount, failureCount, results: [{applicationId, success, message, error?}] }
  */
 exports.batchUpdateStatus = async (req, res) => {
+  let client;
   let transactionStarted = false;
   try {
     const { updates } = req.body;
@@ -1989,7 +2365,8 @@ exports.batchUpdateStatus = async (req, res) => {
 
     const results = [];
 
-    await pool.query('BEGIN');
+    client = await pool.connect();
+    await client.query('BEGIN');
     transactionStarted = true;
 
     // Process each update in the batch
@@ -2017,7 +2394,7 @@ exports.batchUpdateStatus = async (req, res) => {
 
       try {
         // Get current application with row lock
-        const appResult = await pool.query(
+        const appResult = await client.query(
           'SELECT * FROM applications WHERE id = $1 FOR UPDATE',
           [applicationId]
         );
@@ -2032,6 +2409,22 @@ exports.batchUpdateStatus = async (req, res) => {
         }
 
         const currentApplication = appResult.rows[0];
+
+        try {
+          await assertNoActiveHold({
+            client,
+            applicationId,
+            userRole: user.role,
+            currentStatus: currentApplication.status,
+            requestedStatus: newStatus,
+          });
+        } catch (e) {
+          if (e?.httpStatus === 409 && e?.payload?.code === 'APPLICATION_ON_HOLD') {
+            results.push({ applicationId, success: false, message: e.payload.error, ...e.payload });
+            continue;
+          }
+          throw e;
+        }
 
         // Validate transition
         const transitionCheck = validateApplicationStatusTransition({
@@ -2060,20 +2453,14 @@ exports.batchUpdateStatus = async (req, res) => {
           continue;
         }
 
-        // Update application status
-        await pool.query(
-          `UPDATE applications 
-           SET status = $1, last_updated = NOW() 
-           WHERE id = $2`,
-          [newStatus, applicationId]
-        );
-
-        // Record in status history
-        await pool.query(
-          `INSERT INTO application_status_history (application_id, status, changed_at, changed_by, reason, source_stage)
-           VALUES ($1, $2, NOW(), $3, $4, $5)`,
-          [applicationId, newStatus, user.userId, notes || null, `${currentApplication.status}->${newStatus}`]
-        );
+        await applyStatusTransition({
+          client,
+          applicationId,
+          toStatus: newStatus,
+          changedBy: user.userId,
+          reason: notes || null,
+          sourceStage: `${currentApplication.status}->${newStatus}`,
+        });
 
         results.push({
           applicationId,
@@ -2095,7 +2482,7 @@ exports.batchUpdateStatus = async (req, res) => {
     // Check if any failed - if yes, rollback
     const failedResults = results.filter(r => !r.success);
     if (failedResults.length > 0) {
-      await pool.query('ROLLBACK');
+      await client.query('ROLLBACK');
       return res.status(400).json({
         message: 'Batch operation rolled back - one or more updates failed',
         successCount: results.filter(r => r.success).length,
@@ -2104,7 +2491,7 @@ exports.batchUpdateStatus = async (req, res) => {
       });
     }
 
-    await pool.query('COMMIT');
+    await client.query('COMMIT');
 
     res.json({
       message: 'All status updates completed successfully',
@@ -2113,8 +2500,8 @@ exports.batchUpdateStatus = async (req, res) => {
       results,
     });
   } catch (error) {
-    if (transactionStarted) {
-      await pool.query('ROLLBACK').catch(err => console.error('Rollback error:', err));
+    if (transactionStarted && client) {
+      await client.query('ROLLBACK').catch(err => console.error('Rollback error:', err));
     }
     console.error('Batch update status error:', error);
     res.status(500).json({ 
@@ -2124,6 +2511,10 @@ exports.batchUpdateStatus = async (req, res) => {
       failureCount: 0,
       results: [],
     });
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 };
 
@@ -2142,6 +2533,7 @@ exports.batchUpdateStatus = async (req, res) => {
  * Returns: { successCount, failureCount, results: [{applicationId, success, message, error?}] }
  */
 exports.batchAssignApplications = async (req, res) => {
+  let client;
   let transactionStarted = false;
   try {
     const { assignments } = req.body;
@@ -2157,7 +2549,8 @@ exports.batchAssignApplications = async (req, res) => {
 
     const results = [];
 
-    await pool.query('BEGIN');
+    client = await pool.connect();
+    await client.query('BEGIN');
     transactionStarted = true;
 
     const normalizedAssignments = assignments.map((assignment) => ({
@@ -2172,9 +2565,13 @@ exports.batchAssignApplications = async (req, res) => {
 
     // Get all staff IDs upfront to verify they exist
     const staffIds = [...new Set(numericStaffIds)];
-    const staffResult = await pool.query(
-      'SELECT id FROM staff_accounts WHERE id = ANY($1)',
-      [staffIds]
+    const staffResult = await client.query(
+      `SELECT id
+       FROM staff_accounts
+       WHERE id = ANY($1)
+         AND role = ANY($2::text[])
+         AND COALESCE(is_active, true) = true`,
+      [staffIds, ASSIGNABLE_TECHNICAL_OFFICER_ROLES]
     );
 
     const validStaffIds = new Set(staffResult.rows.map(r => r.id));
@@ -2202,13 +2599,9 @@ exports.batchAssignApplications = async (req, res) => {
       }
 
       if (!resolvedStaff) {
-        const staffLookup = await pool.query(
-          `SELECT id FROM staff_accounts WHERE staff_id = $1 OR LOWER(full_name) = LOWER($1) ORDER BY id ASC LIMIT 1`,
-          [assignedTo]
-        );
-
-        if (staffLookup.rows.length) {
-          resolvedStaff = staffLookup.rows[0];
+        const staffLookup = await resolveAssignableTechnicalOfficer(client, assignedTo);
+        if (staffLookup) {
+          resolvedStaff = staffLookup;
         }
       }
 
@@ -2216,14 +2609,14 @@ exports.batchAssignApplications = async (req, res) => {
         results.push({
           applicationId,
           success: false,
-          message: `Staff member ${assignedTo} not found`,
+          message: `Active technical officer ${assignedTo} not found`,
         });
         continue;
       }
 
       try {
         // Get application with row lock
-        const appResult = await pool.query(
+        const appResult = await client.query(
           'SELECT id FROM applications WHERE id = $1 FOR UPDATE',
           [applicationId]
         );
@@ -2238,15 +2631,29 @@ exports.batchAssignApplications = async (req, res) => {
         }
 
         // Check for existing active assignment
-        const existingAssignment = await pool.query(
-          `SELECT id FROM application_assignments 
+        const existingAssignment = await client.query(
+          `SELECT id, assigned_to FROM application_assignments 
            WHERE application_id = $1 AND status IN ('pending', 'accepted', 'in_progress')`,
           [applicationId]
         );
 
         if (existingAssignment.rows.length) {
+          const currentAssignedTo = Number(existingAssignment.rows[0].assigned_to);
+          const isReassignment = Number(resolvedStaff.id) !== currentAssignedTo;
+          if (isReassignment && (!assignment.notes || assignment.notes.length < 5)) {
+            results.push({
+              applicationId,
+              success: false,
+              message: 'Reassignment requires notes with at least 5 characters',
+              code: 'REASSIGNMENT_NOTE_REQUIRED',
+              currentAssignedTo: currentAssignedTo || null,
+              requestedAssignedTo: resolvedStaff.id,
+            });
+            continue;
+          }
+
           // Update existing assignment
-          await pool.query(
+          await client.query(
             `UPDATE application_assignments 
              SET assigned_to = $1, assigned_by = $2, assigned_at = NOW(), notes = COALESCE($3, notes) 
              WHERE application_id = $4 AND status IN ('pending', 'accepted', 'in_progress')`,
@@ -2261,7 +2668,7 @@ exports.batchAssignApplications = async (req, res) => {
           });
         } else {
           // Create new assignment
-          await pool.query(
+          await client.query(
             `INSERT INTO application_assignments (application_id, assigned_to, assigned_by, assignment_type, status)
              VALUES ($1, $2, $3, 'batch_assignment', 'pending')`,
             [applicationId, resolvedStaff.id, user.userId]
@@ -2287,7 +2694,7 @@ exports.batchAssignApplications = async (req, res) => {
     // Check if any failed - if yes, rollback
     const failedResults = results.filter(r => !r.success);
     if (failedResults.length > 0) {
-      await pool.query('ROLLBACK');
+      await client.query('ROLLBACK');
       return res.status(400).json({
         message: 'Batch operation rolled back - one or more assignments failed',
         successCount: results.filter(r => r.success).length,
@@ -2296,7 +2703,7 @@ exports.batchAssignApplications = async (req, res) => {
       });
     }
 
-    await pool.query('COMMIT');
+    await client.query('COMMIT');
 
     res.json({
       message: 'All assignments completed successfully',
@@ -2305,8 +2712,8 @@ exports.batchAssignApplications = async (req, res) => {
       results,
     });
   } catch (error) {
-    if (transactionStarted) {
-      await pool.query('ROLLBACK').catch(err => console.error('Rollback error:', err));
+    if (transactionStarted && client) {
+      await client.query('ROLLBACK').catch(err => console.error('Rollback error:', err));
     }
     console.error('Batch assign error:', error);
     res.status(500).json({ 
@@ -2316,6 +2723,10 @@ exports.batchAssignApplications = async (req, res) => {
       failureCount: 0,
       results: [],
     });
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 }
 
@@ -2365,6 +2776,32 @@ exports.resubmitApplication = async (req, res) => {
       return res.status(400).json({ error: 'Only applications in correction or draft status can be resubmitted' });
     }
 
+    // If an active hold exists, applicant cannot resubmit/advance workflow (admin bypass only).
+    try {
+      await assertNoActiveHold({
+        client,
+        applicationId: id,
+        userRole: user.role,
+        currentStatus: appResult.rows[0].status,
+        requestedStatus: 'submitted',
+      });
+    } catch (e) {
+      if (e?.httpStatus === 409 && e?.payload?.code === 'APPLICATION_ON_HOLD') {
+        await client.query('ROLLBACK');
+        return res.status(409).json(e.payload);
+      }
+      throw e;
+    }
+
+    const feeRecorded = await hasRecordedSubmissionFee(client, id);
+    if (!feeRecorded) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'Application fee payment proof must be recorded before submission.',
+        code: 'FEE_REQUIRED_BEFORE_SUBMISSION',
+      });
+    }
+
     const normalizedName = normalizeString(submitted_applicant_name);
     const normalizedNic = normalizeString(submitted_nic_number);
     const normalizedEmail = normalizeString(submitted_email)?.toLowerCase();
@@ -2372,7 +2809,7 @@ exports.resubmitApplication = async (req, res) => {
     const normalizedContact = normalizeString(submitted_contact) || 'N/A';
     const selectedPermitCodes = parseSelectedPermitCodes(selected_permit_codes);
 
-    // Update application
+    // Update application core fields (status transition is applied by shared helper below)
     const result = await client.query(
       `UPDATE applications 
        SET 
@@ -2389,11 +2826,10 @@ exports.resubmitApplication = async (req, res) => {
          project_details = $11, 
          latitude = $12, 
          longitude = $13, 
-         declaration_accepted = $14,
-         status = 'submitted',
+        declaration_accepted = $14,
          last_updated = NOW()
        WHERE id = $15
-       RETURNING id, application_code, status, submission_date`,
+       RETURNING id, application_code, submission_date`,
       [
         application_type,
         normalizedName,
@@ -2415,18 +2851,19 @@ exports.resubmitApplication = async (req, res) => {
 
     await syncSelectedPermitCodes(client, id, selectedPermitCodes);
 
-    // Add status history entry
-    await client.query(
-      `INSERT INTO application_status_history (application_id, status, changed_at, changed_by, reason)
-       VALUES ($1, 'submitted', NOW(), $2, 'Applicant resubmitted corrected application')`,
-      [id, user.userId]
-    );
+    await applyStatusTransition({
+      client,
+      applicationId: id,
+      toStatus: 'submitted',
+      changedBy: user.userId,
+      reason: 'Applicant resubmitted corrected application',
+    });
 
     await client.query('COMMIT');
 
     res.json({
       message: 'Application resubmitted successfully',
-      application: result.rows[0]
+      application: { ...result.rows[0], status: 'submitted' }
     });
   } catch (error) {
     if (client) await client.query('ROLLBACK');
@@ -2472,6 +2909,38 @@ exports.setApplicationFee = async (req, res) => {
 
     const application = appResult.rows[0];
 
+    try {
+      await assertNoActiveHold({
+        client,
+        applicationId,
+        userRole: user.role,
+        currentStatus: application.status,
+        requestedStatus: 'payment_pending',
+      });
+    } catch (e) {
+      if (e?.httpStatus === 409 && e?.payload?.code === 'APPLICATION_ON_HOLD') {
+        await client.query('ROLLBACK');
+        transactionStarted = false;
+        return res.status(409).json(e.payload);
+      }
+      throw e;
+    }
+
+    const feeTransition = validateApplicationStatusTransition({
+      fromStatus: application.status,
+      toStatus: 'payment_pending',
+      userRole: user.role,
+    });
+    if (!feeTransition.allowed) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(400).json({
+        error: feeTransition.reason || 'Inspection fee cannot be set in the current application status',
+        code: 'INVALID_STATUS_FOR_FEE',
+        currentStatus: application.status,
+      });
+    }
+
     // Create payment record (remove old pending application_fee payments if any)
     await client.query(
       "DELETE FROM payments WHERE application_id = $1 AND payment_type = 'application_fee' AND status = 'pending'",
@@ -2493,20 +2962,14 @@ exports.setApplicationFee = async (req, res) => {
       [applicationId, normalizedAmount, `REQ-${applicationId}-${Date.now()}`]
     );
 
-    // Update application status
-    await client.query(
-      `UPDATE applications 
-       SET status = 'payment_pending', last_updated = NOW() 
-       WHERE id = $1`,
-      [applicationId]
-    );
-
-    // Record in history
-    await client.query(
-      `INSERT INTO application_status_history (application_id, status, changed_at, changed_by, reason, source_stage)
-       VALUES ($1, 'payment_pending', NOW(), $2, $3, 'fee-set')`,
-      [applicationId, user.userId, notes || `Inspection fee of LKR ${normalizedAmount.toLocaleString()} set by planning officer`]
-    );
+    await applyStatusTransition({
+      client,
+      applicationId,
+      toStatus: 'payment_pending',
+      changedBy: user.userId,
+      reason: notes || `Inspection fee of LKR ${normalizedAmount.toLocaleString()} set by planning officer`,
+      sourceStage: 'fee-set',
+    });
 
     // Create notification for applicant
     await client.query(
@@ -2574,9 +3037,37 @@ exports.verifyApplicationPayment = async (req, res) => {
     await client.query('BEGIN');
     transactionStarted = true;
 
+    const appLock = await client.query(
+      'SELECT id, status FROM applications WHERE id = $1 FOR UPDATE',
+      [applicationId]
+    );
+    if (!appLock.rows.length) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(404).json({ error: 'Application not found' });
+    }
+
+    try {
+      await assertNoActiveHold({
+        client,
+        applicationId,
+        userRole: user.role,
+        currentStatus: appLock.rows[0].status,
+        requestedStatus: 'under_review',
+      });
+    } catch (e) {
+      if (e?.httpStatus === 409 && e?.payload?.code === 'APPLICATION_ON_HOLD') {
+        await client.query('ROLLBACK');
+        transactionStarted = false;
+        return res.status(409).json(e.payload);
+      }
+      throw e;
+    }
+
     // Get current application and pending/processing payment
     const paymentResult = await client.query(
-      `SELECT id, status FROM payments 
+      `SELECT id, status, amount, transaction_id, payment_method
+       FROM payments 
        WHERE application_id = $1 AND payment_type = 'application_fee' AND status IN ('pending', 'processing', 'submitted')
        ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
       [applicationId]
@@ -2600,7 +3091,35 @@ exports.verifyApplicationPayment = async (req, res) => {
       return res.status(404).json({ error: 'No pending or processing inspection fee payment record found for this application' });
     }
 
-    const paymentId = paymentResult.rows[0].id;
+    if (appLock.rows[0].status !== 'payment_pending') {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(400).json({
+        error: 'Payment can only be verified while the application is awaiting inspection fee payment',
+        code: 'INVALID_STATUS_FOR_PAYMENT_VERIFY',
+        currentStatus: appLock.rows[0].status,
+      });
+    }
+
+    const pendingPayment = paymentResult.rows[0];
+    if (!Number.isFinite(Number.parseFloat(pendingPayment.amount)) || Number.parseFloat(pendingPayment.amount) <= 0) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(400).json({
+        error: 'Cannot verify payment with invalid requested fee amount',
+        code: 'INVALID_FEE_RECORD',
+      });
+    }
+    if (!pendingPayment.transaction_id) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(400).json({
+        error: 'Payment reference is required before verification',
+        code: 'PAYMENT_REFERENCE_REQUIRED',
+      });
+    }
+
+    const paymentId = pendingPayment.id;
 
     // Update payment status
     await client.query(
@@ -2608,18 +3127,14 @@ exports.verifyApplicationPayment = async (req, res) => {
       [paymentId]
     );
 
-    // Update application status to under_review (ready for TO assignment)
-    await client.query(
-      "UPDATE applications SET status = 'under_review', last_updated = NOW() WHERE id = $1",
-      [applicationId]
-    );
-
-    // Record in history
-    await client.query(
-      `INSERT INTO application_status_history (application_id, status, changed_at, changed_by, reason, source_stage)
-       VALUES ($1, 'under_review', NOW(), $2, 'Payment verified by planning officer', 'payment-verified')`,
-      [applicationId, user.userId]
-    );
+    await applyStatusTransition({
+      client,
+      applicationId,
+      toStatus: 'under_review',
+      changedBy: user.userId,
+      reason: 'Payment verified by planning officer',
+      sourceStage: 'payment-verified',
+    });
 
     // Create notification for applicant
     await client.query(

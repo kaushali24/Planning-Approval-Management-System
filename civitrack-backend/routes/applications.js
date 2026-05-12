@@ -325,6 +325,7 @@ router.patch(
 router.get(
   '/:id/assignments',
   authMiddleware,
+  requireRole(['applicant', 'planning_officer', 'technical_officer', 'superintendent', 'committee', 'admin']),
   param('id').isInt({ min: 1 }),
   validateRequest,
   applicationController.getApplicationAssignments
@@ -404,6 +405,7 @@ router.post(
   param('id').isInt({ min: 1 }),
   validateRequest,
   documentController.upload.array('files', 20),
+  documentController.enforceMagicByteValidation,
   validateUploadDocuments,
   applicationController.uploadApplicationDocuments
 );
@@ -415,8 +417,21 @@ router.post(
   param('id').isInt({ min: 1 }),
   validateRequest,
   documentController.upload.array('files', 20),
+  documentController.enforceMagicByteValidation,
   isApplicationOwner(pool),
   applicationController.resubmitCorrections
+);
+
+router.post(
+  '/:id/investigation-response',
+  authMiddleware,
+  requireRole(['applicant']),
+  param('id').isInt({ min: 1 }),
+  validateRequest,
+  documentController.upload.array('files', 10),
+  documentController.enforceMagicByteValidation,
+  isApplicationOwner(pool),
+  applicationController.submitInvestigationResponse
 );
 
 router.get(
@@ -439,7 +454,7 @@ router.delete(
 router.post(
   '/:id/payment-proof',
   authMiddleware,
-  requireRole(['applicant', 'planning_officer', 'technical_officer', 'superintendent', 'committee', 'admin']),
+  requireRole(['applicant', 'planning_officer', 'admin']),
   param('id').isInt({ min: 1 }).withMessage('Valid application id is required'),
   body('amount').isFloat({ min: 0.01 }).withMessage('amount must be a valid positive number'),
   body('payment_method').isIn(['bank', 'counter']).withMessage('payment_method must be bank or counter'),
@@ -453,7 +468,7 @@ router.post(
 router.post(
   '/:id/payments/online',
   authMiddleware,
-  requireRole(['applicant', 'planning_officer', 'technical_officer', 'superintendent', 'committee', 'admin']),
+  requireRole(['applicant', 'planning_officer', 'admin']),
   param('id').isInt({ min: 1 }).withMessage('Valid application id is required'),
   body('amount').isFloat({ min: 0.01 }).withMessage('amount must be a valid positive number'),
   body('transaction_id').optional({ nullable: true }).isString(),

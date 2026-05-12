@@ -138,7 +138,6 @@ const SAMPLE_SEEDS = [
       recommendation: 'approve',
     },
     coc: {
-      cocId: 'COC-2026-000002',
       status: 'coc-collected',
       declarations: ['construction_complete', 'ready_for_inspection', 'understands_enforcement'],
       feeAmount: 1500,
@@ -150,7 +149,6 @@ const SAMPLE_SEEDS = [
       validUntil: yearsFromNow(2),
     },
     permit: {
-      permitReference: 'PRM-2026-000002',
       permitType: 'building',
       issuedAt: daysAgo(2),
       validUntil: yearsFromNow(5),
@@ -305,7 +303,6 @@ const SAMPLE_SEEDS = [
       recommendation: 'approve',
     },
     coc: {
-      cocId: 'COC-2026-000006',
       status: 'coc-collected',
       declarations: ['construction_complete', 'ready_for_inspection', 'understands_enforcement'],
       feeAmount: 1500,
@@ -317,7 +314,6 @@ const SAMPLE_SEEDS = [
       validUntil: yearsFromNow(2),
     },
     permit: {
-      permitReference: 'PRM-2026-000006',
       permitType: 'building',
       issuedAt: daysAgo(12),
       validUntil: yearsFromNow(5),
@@ -765,6 +761,8 @@ async function ensureCocRequest(applicationId, applicant, inspectionId, coc, sta
     return existing.rows[0].id;
   }
 
+  const cocId = `COC-${new Date().getFullYear()}-${String(applicationId).padStart(6, '0')}`;
+
   const technicalOfficer = staff.technical_officer || staff.admin;
   const result = await pool.query(
     `INSERT INTO coc_requests (
@@ -793,7 +791,7 @@ async function ensureCocRequest(applicationId, applicant, inspectionId, coc, sta
     )
     RETURNING id`,
     [
-      coc.cocId,
+      cocId,
       applicationId,
       applicant.id,
       applicant.email,
@@ -840,6 +838,16 @@ async function ensureCocDeclarations(cocRequestId, declarations) {
   }
 }
 
+async function normalizeCocIds() {
+  // Keep a distinct COC identifier namespace; application code remains for display columns in UI.
+  await pool.query(
+    `UPDATE coc_requests
+     SET coc_id = CONCAT('COC-', EXTRACT(YEAR FROM COALESCE(request_date, NOW()))::int, '-', LPAD(application_id::text, 6, '0'))
+     WHERE coc_id IS NULL
+        OR coc_id NOT LIKE 'COC-%'`
+  );
+}
+
 async function ensurePermitWorkflow(applicationId, permit, staff) {
   if (!permit) {
     return null;
@@ -853,6 +861,14 @@ async function ensurePermitWorkflow(applicationId, permit, staff) {
   if (existing.rows.length > 0) {
     return existing.rows[0].id;
   }
+
+  const appMeta = await pool.query(
+    `SELECT application_code
+     FROM applications
+     WHERE id = $1`,
+    [applicationId]
+  );
+  const applicationCode = appMeta.rows[0]?.application_code || String(applicationId);
 
   const admin = staff.admin || null;
   const result = await pool.query(
@@ -875,7 +891,7 @@ async function ensurePermitWorkflow(applicationId, permit, staff) {
     RETURNING id`,
     [
       applicationId,
-      permit.permitReference,
+      applicationCode,
       permit.permitType,
       permit.issuedAt || null,
       permit.validUntil || null,
@@ -1265,6 +1281,8 @@ async function seed() {
 
       console.log(`✓ Seeded workflow data for ${seed.submittedApplicantName}`);
     }
+
+    await normalizeCocIds();
 
     const applicantRefColumn = await getApplicantReferenceColumn();
     const applicantRefSelect = applicantRefColumn

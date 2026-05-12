@@ -90,6 +90,9 @@ const removeFileIfExists = async (filePath) => {
 };
 
 const getDocumentFilePath = (document) => buildDocumentAbsolutePath(document.storage_key || document.file_url || '');
+const ensureTempDocumentsRoot = async () => {
+  await fs.promises.mkdir(TEMP_DOCUMENTS_ROOT, { recursive: true });
+};
 
 module.exports = {
   DOCUMENTS_ROOT,
@@ -101,4 +104,5 @@ module.exports = {
   moveUploadedFile,
   removeFileIfExists,
   getDocumentFilePath,
+  ensureTempDocumentsRoot,
 };

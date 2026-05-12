@@ -14,7 +14,7 @@ router.post(
   param('applicationId').isInt({ min: 1 }).withMessage('Valid applicationId is required'),
   body('valid_until').isISO8601().withMessage('valid_until is required and must be a valid date'),
   body('permit_reference').optional().isString(),
-  body('max_years').optional().isInt({ min: 1, max: 10 }),
+  body('max_years').optional().isInt({ min: 1, max: 5 }),
   validateRequest,
   permitController.issuePermit
 );
@@ -26,6 +26,15 @@ router.get(
   query('days').optional().isInt({ min: 1, max: 90 }).toInt(),
   validateRequest,
   permitController.getExpiringPermits
+);
+
+router.get(
+  '/planning-queue',
+  authMiddleware,
+  requireRole(['planning_officer', 'superintendent', 'admin']),
+  query('limit').optional().isInt({ min: 1, max: 200 }).toInt(),
+  validateRequest,
+  permitController.listPlanningPermitQueue
 );
 
 router.get(

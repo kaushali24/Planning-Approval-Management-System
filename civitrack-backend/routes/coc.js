@@ -10,7 +10,7 @@ const router = express.Router();
 router.post(
   '/',
   authMiddleware,
-  requireRole(['applicant', 'planning_officer', 'technical_officer', 'superintendent', 'committee', 'admin']),
+  requireRole(['applicant', 'planning_officer', 'admin']),
   body('application_id').isInt({ min: 1 }).withMessage('Valid application_id is required'),
   body('notes').optional().isString(),
   body('declarations').optional().isArray(),
@@ -41,7 +41,7 @@ router.get(
 router.patch(
   '/:id/status',
   authMiddleware,
-  requireRole(['planning_officer', 'technical_officer', 'superintendent', 'committee', 'admin']),
+  requireRole(['planning_officer', 'technical_officer', 'committee', 'admin']),
   param('id').isInt({ min: 1 }).withMessage('Valid COC request id is required'),
   body('status').notEmpty().isString().withMessage('status is required'),
   body('notes').optional().isString(),
@@ -54,7 +54,7 @@ router.patch(
 router.post(
   '/:id/declarations',
   authMiddleware,
-  requireRole(['applicant', 'planning_officer', 'technical_officer', 'superintendent', 'committee', 'admin']),
+  requireRole(['applicant', 'admin']),
   param('id').isInt({ min: 1 }).withMessage('Valid COC request id is required'),
   body('declaration_type')
     .isIn(['construction_complete', 'ready_for_inspection', 'understands_enforcement'])
@@ -67,7 +67,7 @@ router.post(
 router.post(
   '/:id/payments',
   authMiddleware,
-  requireRole(['applicant', 'planning_officer', 'technical_officer', 'superintendent', 'committee', 'admin']),
+  requireRole(['applicant', 'admin']),
   param('id').isInt({ min: 1 }).withMessage('Valid COC request id is required'),
   body('amount').isFloat({ min: 0.01 }).withMessage('amount must be a valid positive number'),
   body('payment_method').optional().isString(),
@@ -80,7 +80,7 @@ router.post(
 router.post(
   '/:id/corrections',
   authMiddleware,
-  requireRole(['applicant', 'planning_officer', 'technical_officer', 'superintendent', 'committee', 'admin']),
+  requireRole(['applicant', 'admin']),
   param('id').isInt({ min: 1 }).withMessage('Valid COC request id is required'),
   body('evidence_note').notEmpty().isString().withMessage('evidence_note is required'),
   validateRequest,
@@ -90,7 +90,7 @@ router.post(
 router.post(
   '/:id/reinspection-request',
   authMiddleware,
-  requireRole(['applicant', 'planning_officer', 'technical_officer', 'superintendent', 'committee', 'admin']),
+  requireRole(['applicant', 'admin']),
   param('id').isInt({ min: 1 }).withMessage('Valid COC request id is required'),
   validateRequest,
   cocController.requestApplicantReinspection
@@ -99,7 +99,7 @@ router.post(
 router.post(
   '/:id/violations',
   authMiddleware,
-  requireRole(['planning_officer', 'technical_officer', 'superintendent', 'committee', 'admin']),
+  requireRole(['technical_officer', 'admin']),
   param('id').isInt({ min: 1 }).withMessage('Valid COC request id is required'),
   body('deviation_type').notEmpty().isString(),
   body('fine_amount').isFloat({ min: 0 }).withMessage('fine_amount must be >= 0'),
@@ -114,7 +114,7 @@ router.post(
 router.post(
   '/:id/reinspections',
   authMiddleware,
-  requireRole(['planning_officer', 'technical_officer', 'superintendent', 'committee', 'admin']),
+  requireRole(['technical_officer', 'admin']),
   param('id').isInt({ min: 1 }).withMessage('Valid COC request id is required'),
   body('result').optional().isIn(['pending', 'compliant', 'deviation']),
   body('notes').optional().isString(),

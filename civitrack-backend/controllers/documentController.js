@@ -1,4 +1,6 @@
 const multer = require('multer');
+const fs = require('fs').promises;
+const path = require('path');
 const pool = require('../config/db');
 const {
   TEMP_DOCUMENTS_ROOT,
@@ -7,12 +9,18 @@ const {
   moveUploadedFile,
   removeFileIfExists,
   getDocumentFilePath,
+  ensureTempDocumentsRoot,
 } = require('../utils/documentStorage');
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, TEMP_DOCUMENTS_ROOT);
+  destination: async (req, file, cb) => {
+    try {
+      await ensureTempDocumentsRoot();
+      cb(null, TEMP_DOCUMENTS_ROOT);
+    } catch (error) {
+      cb(error);
+    }
   },
   filename: (req, file, cb) => {
     cb(null, createSafeUploadFilename(file.originalname));
@@ -44,12 +52,81 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
 });
 
+const getFilesFromRequest = (req) => {
+  if (Array.isArray(req.files)) return req.files;
+  if (req.files && typeof req.files === 'object') return Object.values(req.files).flat();
+  if (req.file) return [req.file];
+  return [];
+};
+
+const startsWithSignature = (buffer, signature) => signature.every((byte, index) => buffer[index] === byte);
+
+const hasValidMagicBytes = (buffer, mimetype) => {
+  // PDF
+  if (mimetype === 'application/pdf') {
+    return startsWithSignature(buffer, [0x25, 0x50, 0x44, 0x46]); // %PDF
+  }
+  // JPEG
+  if (mimetype === 'image/jpeg') {
+    return startsWithSignature(buffer, [0xff, 0xd8, 0xff]);
+  }
+  // PNG
+  if (mimetype === 'image/png') {
+    return startsWithSignature(buffer, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  }
+  // Legacy Office (DOC/XLS - OLE)
+  if (mimetype === 'application/msword' || mimetype === 'application/vnd.ms-excel') {
+    return startsWithSignature(buffer, [0xd0, 0xcf, 0x11, 0xe0]);
+  }
+  // Modern Office (DOCX/XLSX - ZIP container)
+  if (
+    mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
+    mimetype === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  ) {
+    return startsWithSignature(buffer, [0x50, 0x4b, 0x03, 0x04]);
+  }
+  return false;
+};
+
+const validateFileSignature = async (file) => {
+  const handle = await fs.open(file.path, 'r');
+  try {
+    const buffer = Buffer.alloc(16);
+    await handle.read(buffer, 0, 16, 0);
+    return hasValidMagicBytes(buffer, file.mimetype);
+  } finally {
+    await handle.close();
+  }
+};
+
+const enforceMagicByteValidation = async (req, res, next) => {
+  try {
+    const files = getFilesFromRequest(req);
+    for (const file of files) {
+      const valid = await validateFileSignature(file);
+      if (!valid) {
+        await Promise.all(
+          files.map((f) => removeFileIfExists(f.path).catch(() => {}))
+        );
+        return res.status(400).json({
+          error: `Uploaded file content does not match declared type for ${file.originalname || file.filename}`,
+          code: 'INVALID_FILE_SIGNATURE',
+        });
+      }
+    }
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+};
+
 /**
  * Upload document for application
  * POST /api/documents/upload
  */
 exports.uploadDocument = [
   upload.single('file'),
+  enforceMagicByteValidation,
   async (req, res) => {
     let storedFilePath = null;
     try {
@@ -270,10 +347,62 @@ exports.downloadDocument = async (req, res) => {
   }
 };
 
+/**
+ * Serve uploaded document by storage path with auth checks.
+ * GET /uploads/*
+ */
+exports.getProtectedUpload = async (req, res) => {
+  try {
+    const user = req.user || {};
+    const rawStoragePath = String(req.params[0] || '').trim();
+    if (!rawStoragePath) {
+      return res.status(400).json({ error: 'File path is required' });
+    }
+
+    const normalizedPath = path.posix.normalize(rawStoragePath);
+    if (normalizedPath.startsWith('..') || normalizedPath.includes('\\')) {
+      return res.status(400).json({ error: 'Invalid file path' });
+    }
+
+    const docResult = await pool.query(
+      `SELECT d.*, a.applicant_id
+       FROM documents d
+       JOIN applications a ON a.id = d.application_id
+       WHERE d.storage_key = $1 OR d.file_url = $1
+       ORDER BY d.id DESC
+       LIMIT 1`,
+      [normalizedPath]
+    );
+
+    if (!docResult.rows.length) {
+      return res.status(404).json({ error: 'Document not found' });
+    }
+
+    const doc = docResult.rows[0];
+    if ((user.accountType === 'applicant' || user.role === 'applicant') && Number(doc.applicant_id) !== Number(user.userId)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const filePath = getDocumentFilePath(doc);
+    try {
+      await fs.access(filePath);
+    } catch (_error) {
+      return res.status(404).json({ error: 'File not found on disk' });
+    }
+
+    return res.sendFile(filePath);
+  } catch (error) {
+    console.error('Protected upload access error:', error);
+    return res.status(500).json({ error: 'Failed to access file', details: error.message });
+  }
+};
+
 module.exports = {
   upload,
+  enforceMagicByteValidation,
   uploadDocument: exports.uploadDocument,
   getApplicationDocuments: exports.getApplicationDocuments,
   deleteDocument: exports.deleteDocument,
   downloadDocument: exports.downloadDocument,
+  getProtectedUpload: exports.getProtectedUpload,
 };

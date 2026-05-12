@@ -1,6 +1,7 @@
 const { validationResult } = require('express-validator');
 const pool = require('../config/db');
 const { sendError } = require('../middleware/errorHandler');
+const { applyStatusTransition } = require('../utils/applicationStatusUpdater');
 
 const isApplicantUser = (user) => user.accountType === 'applicant' || user.role === 'applicant';
 const isBuildingApplication = (applicationType) => String(applicationType || '').trim().toLowerCase() === 'building';
@@ -15,19 +16,13 @@ const applyStatusWithFallback = async (client, applicationId, preferredStatuses,
   for (const status of preferredStatuses) {
     try {
       await client.query('SAVEPOINT app_status_attempt');
-
-      await client.query(
-        `UPDATE applications
-         SET status = $1, last_updated = NOW()
-         WHERE id = $2`,
-        [status, applicationId]
-      );
-
-      await client.query(
-        `INSERT INTO application_status_history (application_id, status, changed_by, reason)
-         VALUES ($1, $2, $3, $4)`,
-        [applicationId, status, changedBy, reason]
-      );
+      await applyStatusTransition({
+        client,
+        applicationId,
+        toStatus: status,
+        changedBy,
+        reason,
+      });
 
       await client.query('RELEASE SAVEPOINT app_status_attempt');
 
@@ -70,11 +65,19 @@ exports.issuePermit = async (req, res) => {
 
     const applicationId = parseInt(req.params.applicationId, 10);
     const { valid_until, permit_reference, max_years = 5 } = req.body;
+    const normalizedMaxYears = Number.parseInt(max_years, 10);
+    if (!Number.isInteger(normalizedMaxYears) || normalizedMaxYears < 1 || normalizedMaxYears > 5) {
+      return sendError(res, 400, 'max_years must be between 1 and 5', {
+        code: 'PERMIT_MAX_YEARS_INVALID',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
 
     await client.query('BEGIN');
 
     const appResult = await client.query(
-      `SELECT id, applicant_id, application_type, status
+      `SELECT id, applicant_id, application_type, status, application_code
        FROM applications
        WHERE id = $1`,
       [applicationId]
@@ -112,7 +115,7 @@ exports.issuePermit = async (req, res) => {
       });
     }
 
-    const generatedReference = permit_reference || `PRM-${new Date().getFullYear()}-${String(applicationId).padStart(6, '0')}`;
+    const generatedReference = application.application_code || permit_reference || String(applicationId);
 
     const permitResult = await client.query(
       `INSERT INTO permit_workflow (
@@ -133,7 +136,7 @@ exports.issuePermit = async (req, res) => {
         application.application_type || 'building',
         valid_until,
         req.user.userId,
-        max_years,
+        normalizedMaxYears,
       ]
     );
 
@@ -267,9 +270,10 @@ exports.extendPermit = async (req, res) => {
     await client.query('BEGIN');
 
     const permitResult = await client.query(
-      `SELECT *
-       FROM permit_workflow
-       WHERE application_id = $1`,
+      `SELECT p.*, a.application_type, a.status AS application_status
+       FROM permit_workflow p
+       LEFT JOIN applications a ON a.id = p.application_id
+       WHERE p.application_id = $1`,
       [applicationId]
     );
 
@@ -284,7 +288,8 @@ exports.extendPermit = async (req, res) => {
 
     const permit = permitResult.rows[0];
 
-    if (!isBuildingApplication(permit.permit_type || permit.application_type)) {
+    const resolvedPermitType = permit.permit_type || permit.application_type;
+    if (resolvedPermitType && !isBuildingApplication(resolvedPermitType)) {
       await client.query('ROLLBACK');
       return sendError(res, 400, 'Permit extensions are available only for building applications', {
         code: 'PERMIT_EXTENSION_NOT_ALLOWED',
@@ -301,12 +306,43 @@ exports.extendPermit = async (req, res) => {
         method: req.method,
       });
     }
+    if (String(payment_status || '').toLowerCase() !== 'completed') {
+      await client.query('ROLLBACK');
+      return sendError(res, 400, 'Only completed payments can be used for permit extension', {
+        code: 'PERMIT_EXTENSION_PAYMENT_INCOMPLETE',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
+    if (!String(payment_reference || '').trim() || !String(payment_method || '').trim()) {
+      await client.query('ROLLBACK');
+      return sendError(res, 400, 'payment_reference and payment_method are required for permit extension', {
+        code: 'PERMIT_EXTENSION_PAYMENT_DETAILS_REQUIRED',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
 
     const previousValid = new Date(permit.valid_until);
     const extendedValid = new Date(previousValid);
     extendedValid.setFullYear(extendedValid.getFullYear() + 1);
 
     const extensionNo = permit.extensions_used + 1;
+    const extensionNoCheck = await client.query(
+      `SELECT COALESCE(MAX(extension_no), 0) + 1 AS expected_no
+       FROM permit_extensions
+       WHERE permit_id = $1`,
+      [permit.id]
+    );
+    const expectedNo = Number.parseInt(extensionNoCheck.rows[0]?.expected_no, 10) || 1;
+    if (expectedNo !== extensionNo) {
+      await client.query('ROLLBACK');
+      return sendError(res, 409, 'Permit extension sequence mismatch detected', {
+        code: 'PERMIT_EXTENSION_SEQUENCE_MISMATCH',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
 
     const extensionResult = await client.query(
       `INSERT INTO permit_extensions (
@@ -389,9 +425,10 @@ exports.collectPermit = async (req, res) => {
     await client.query('BEGIN');
 
     const permitResult = await client.query(
-      `SELECT *
-       FROM permit_workflow
-       WHERE application_id = $1`,
+      `SELECT p.*, a.application_type
+       FROM permit_workflow p
+       LEFT JOIN applications a ON a.id = p.application_id
+       WHERE p.application_id = $1`,
       [applicationId]
     );
 
@@ -405,8 +442,26 @@ exports.collectPermit = async (req, res) => {
     }
 
     const permit = permitResult.rows[0];
+    if (permit.permit_collected) {
+      await client.query('ROLLBACK');
+      return sendError(res, 409, 'Permit is already marked as collected', {
+        code: 'PERMIT_ALREADY_COLLECTED',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
+    if (permit.application_status && permit.application_status !== 'permit_approved') {
+      await client.query('ROLLBACK');
+      return sendError(res, 400, 'Permit can only be collected when application status is permit_approved', {
+        code: 'PERMIT_COLLECTION_INVALID_STATUS',
+        details: { currentStatus: permit.application_status },
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
 
-    if (!isBuildingApplication(permit.permit_type)) {
+    const resolvedPermitType = permit.permit_type || permit.application_type;
+    if (resolvedPermitType && !isBuildingApplication(resolvedPermitType)) {
       await client.query('ROLLBACK');
       return sendError(res, 400, 'Permit collection is available only for building applications', {
         code: 'PERMIT_COLLECTION_NOT_ALLOWED',
@@ -469,6 +524,57 @@ exports.collectPermit = async (req, res) => {
     });
   } finally {
     client.release();
+  }
+};
+
+/**
+ * Planning counter: issued permits with application context (collection, extensions).
+ * GET /api/permits/planning-queue
+ */
+exports.listPlanningPermitQueue = async (req, res) => {
+  try {
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit || '100', 10)));
+
+    const result = await pool.query(
+      `SELECT
+        p.id,
+        p.application_id,
+        p.permit_reference,
+        p.permit_type,
+        p.issued_at,
+        p.valid_until,
+        p.permit_collected,
+        p.permit_collected_at,
+        p.extensions_used,
+        p.max_years,
+        a.application_code,
+        a.status AS application_status,
+        a.submitted_applicant_name,
+        a.submitted_email,
+        a.application_type
+       FROM permit_workflow p
+       JOIN applications a ON a.id = p.application_id
+       ORDER BY
+         CASE WHEN COALESCE(p.permit_collected, FALSE) THEN 1 ELSE 0 END,
+         p.issued_at DESC NULLS LAST,
+         p.id DESC
+       LIMIT $1`,
+      [limit]
+    );
+
+    res.json({ permits: result.rows });
+  } catch (error) {
+    console.error('List planning permit queue error:', error);
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'PERMIT_QUEUE_FETCH_FAILED',
+        message: 'Failed to fetch permit queue',
+        details: error.message,
+        path: req.originalUrl,
+        method: req.method,
+      },
+    });
   }
 };
 

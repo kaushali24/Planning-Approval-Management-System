@@ -1,4 +1,5 @@
 const nodemailer = require('nodemailer');
+const pool = require('../config/db');
 
 // Create transporter with Gmail SMTP
 const createTransporter = () => {
@@ -16,6 +17,50 @@ const createTransporter = () => {
  */
 const generateOTP = () => {
   return Math.floor(100000 + Math.random() * 900000).toString();
+};
+
+const recordEmailDeliveryAudit = async ({
+  templateKey,
+  recipientEmail,
+  status,
+  messageId = null,
+  errorMessage = null,
+  context = {},
+}) => {
+  try {
+    await pool.query(
+      `INSERT INTO email_delivery_audit (
+         template_key, recipient_email, status, message_id, error_message, context
+       ) VALUES ($1, $2, $3, $4, $5, $6)`,
+      [templateKey, recipientEmail, status, messageId, errorMessage, JSON.stringify(context || {})]
+    );
+  } catch (auditError) {
+    // Never break workflow for email audit insert failures.
+    console.error('Email audit write failed:', auditError?.message || auditError);
+  }
+};
+
+const sendMailWithAudit = async ({ transporter, mailOptions, templateKey, recipientEmail, context = {} }) => {
+  try {
+    const info = await transporter.sendMail(mailOptions);
+    await recordEmailDeliveryAudit({
+      templateKey,
+      recipientEmail,
+      status: 'sent',
+      messageId: info.messageId,
+      context,
+    });
+    return { success: true, messageId: info.messageId };
+  } catch (error) {
+    await recordEmailDeliveryAudit({
+      templateKey,
+      recipientEmail,
+      status: 'failed',
+      errorMessage: error.message,
+      context,
+    });
+    return { success: false, error: error.message };
+  }
 };
 
 /**
@@ -95,14 +140,13 @@ Kelaniya Pradeshiya Sabha
     `,
   };
 
-  try {
-    const info = await transporter.sendMail(mailOptions);
-    console.log('Verification email sent:', info.messageId);
-    return { success: true, messageId: info.messageId };
-  } catch (error) {
-    console.error('Email send error:', error);
-    return { success: false, error: error.message };
-  }
+  return sendMailWithAudit({
+    transporter,
+    mailOptions,
+    templateKey: 'verification_otp',
+    recipientEmail: email,
+    context: { fullName },
+  });
 };
 
 /**
@@ -163,14 +207,13 @@ const sendPasswordResetEmail = async (email, fullName, otp) => {
     `,
   };
 
-  try {
-    const info = await transporter.sendMail(mailOptions);
-    console.log('Password reset email sent:', info.messageId);
-    return { success: true, messageId: info.messageId };
-  } catch (error) {
-    console.error('Email send error:', error);
-    return { success: false, error: error.message };
-  }
+  return sendMailWithAudit({
+    transporter,
+    mailOptions,
+    templateKey: 'password_reset_otp',
+    recipientEmail: email,
+    context: { fullName },
+  });
 };
 
 /**
@@ -271,14 +314,13 @@ Kelaniya Pradeshiya Sabha
     `,
   };
 
-  try {
-    const info = await transporter.sendMail(mailOptions);
-    console.log('Application to SW review notification sent:', info.messageId);
-    return { success: true, messageId: info.messageId };
-  } catch (error) {
-    console.error('Email send error:', error);
-    return { success: false, error: error.message };
-  }
+  return sendMailWithAudit({
+    transporter,
+    mailOptions,
+    templateKey: 'application_to_superintendent',
+    recipientEmail: email,
+    context: { applicationId, recommendation },
+  });
 };
 
 /**
@@ -590,14 +632,13 @@ Best regards,
     `,
   };
 
-  try {
-    const info = await transporter.sendMail(mailOptions);
-    console.log('Applicant approval email sent:', info.messageId);
-    return { success: true, messageId: info.messageId };
-  } catch (error) {
-    console.error('Email send error:', error);
-    return { success: false, error: error.message };
-  }
+  return sendMailWithAudit({
+    transporter,
+    mailOptions,
+    templateKey: 'applicant_approved',
+    recipientEmail: email,
+    context: { applicationId },
+  });
 };
 
 /**
@@ -847,14 +888,13 @@ CiviTrack System
     `,
   };
 
-  try {
-    const info = await transporter.sendMail(mailOptions);
-    console.log('Applicant corrections email sent:', info.messageId);
-    return { success: true, messageId: info.messageId };
-  } catch (error) {
-    console.error('Email send error:', error);
-    return { success: false, error: error.message };
-  }
+  return sendMailWithAudit({
+    transporter,
+    mailOptions,
+    templateKey: 'applicant_corrections',
+    recipientEmail: email,
+    context: { applicationId },
+  });
 };
 
 /**
@@ -933,14 +973,13 @@ Kelaniya Pradeshiya Sabha
     `,
   };
 
-  try {
-    const info = await transporter.sendMail(mailOptions);
-    console.log('Applicant inspection scheduled email sent:', info.messageId);
-    return { success: true, messageId: info.messageId };
-  } catch (error) {
-    console.error('Email send error:', error);
-    return { success: false, error: error.message };
-  }
+  return sendMailWithAudit({
+    transporter,
+    mailOptions,
+    templateKey: 'inspection_scheduled',
+    recipientEmail: email,
+    context: { applicationId, scheduledAt },
+  });
 };
 
 module.exports = {

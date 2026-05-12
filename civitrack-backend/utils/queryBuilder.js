@@ -70,7 +70,7 @@ function buildFilterConditions(filters, options = {}) {
 
   // Filter by status
   if (status) {
-    conditions.push(`a.status = $${params.length + 1}`);
+    conditions.push(`COALESCE(latest_status_history.status, a.status) = $${params.length + 1}`);
     params.push(status);
   }
 

@@ -106,6 +106,9 @@ describe('appeals integration', () => {
         if (sql === 'BEGIN' || sql === 'ROLLBACK') {
           return { rows: [] };
         }
+        if (sql.includes('FROM applications') && sql.includes('FOR UPDATE')) {
+          return { rows: [{ id: 200, status: 'not_granted_appeal_required' }] };
+        }
 
         if (sql.includes('SELECT id FROM appeal_cases WHERE application_id = $1')) {
           return { rows: [{ id: 1 }] };
@@ -134,6 +137,42 @@ describe('appeals integration', () => {
     );
     expect(mockClient.query).toHaveBeenCalledWith('BEGIN');
     expect(mockClient.query).toHaveBeenCalledWith('ROLLBACK');
+  });
+
+  test('POST /api/appeals rejects ineligible application status', async () => {
+    const { app } = loadAppWithMocks({
+      user: { userId: 11, role: 'applicant', accountType: 'applicant' },
+      poolQueryImpl: async (sql) => {
+        if (sql.includes('SELECT id FROM applications WHERE id = $1 AND applicant_id = $2')) {
+          return { rows: [{ id: 300 }] };
+        }
+        return { rows: [] };
+      },
+      poolConnectQueryImpl: async (sql) => {
+        if (sql === 'BEGIN' || sql === 'ROLLBACK') return { rows: [] };
+        if (sql.includes('FROM applications') && sql.includes('FOR UPDATE')) {
+          return { rows: [{ id: 300, status: 'approved' }] };
+        }
+        return { rows: [] };
+      },
+    });
+
+    const response = await request(app)
+      .post('/api/appeals')
+      .send({
+        application_id: 300,
+        route: 'committee',
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual(
+      expect.objectContaining({
+        success: false,
+        error: expect.objectContaining({
+          code: 'APPEAL_NOT_ELIGIBLE_STATUS',
+        }),
+      })
+    );
   });
 
   test('GET /api/appeals/:id returns 404 when appeal case is missing', async () => {
@@ -185,5 +224,62 @@ describe('appeals integration', () => {
     );
     expect(pool.connect).toHaveBeenCalledTimes(1);
     expect(mockClient.query).not.toHaveBeenCalledWith('BEGIN');
+  });
+
+  test('POST /api/appeals/:id/versions blocks applicant when portal is closed', async () => {
+    const { app } = loadAppWithMocks({
+      user: { userId: 55, role: 'applicant', accountType: 'applicant' },
+      poolQueryImpl: async (sql) => {
+        if (sql.includes('FROM appeal_cases ac') && sql.includes('a.applicant_id = $2')) {
+          return { rows: [{ id: 901 }] };
+        }
+        return { rows: [] };
+      },
+      poolConnectQueryImpl: async (sql) => {
+        if (sql === 'BEGIN' || sql === 'ROLLBACK') return { rows: [] };
+        if (sql.includes('SELECT * FROM appeal_cases WHERE id = $1 FOR UPDATE')) {
+          return { rows: [{ id: 901, status: 'resubmit-required', portal_open: false }] };
+        }
+        return { rows: [] };
+      },
+    });
+
+    const response = await request(app)
+      .post('/api/appeals/901/versions')
+      .send({
+        summary: 'Updated appeal evidence',
+      });
+
+    expect(response.status).toBe(403);
+    expect(response.body).toEqual(
+      expect.objectContaining({
+        success: false,
+        error: expect.objectContaining({
+          code: 'APPEAL_PORTAL_CLOSED',
+        }),
+      })
+    );
+  });
+
+  test('PATCH /api/appeals/:id/status rejects route/status mismatch', async () => {
+    const { app } = loadAppWithMocks({
+      user: { userId: 1, role: 'admin', accountType: 'staff' },
+      poolQueryImpl: async () => ({ rows: [] }),
+      poolConnectQueryImpl: async () => ({ rows: [] }),
+    });
+
+    const response = await request(app)
+      .patch('/api/appeals/55/status')
+      .send({ status: 'forwarded-to-committee', route: 'technical-officer' });
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual(
+      expect.objectContaining({
+        success: false,
+        error: expect.objectContaining({
+          code: 'APPEAL_ROUTE_STATUS_MISMATCH',
+        }),
+      })
+    );
   });
 });

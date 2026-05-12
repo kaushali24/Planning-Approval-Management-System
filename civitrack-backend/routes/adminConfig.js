@@ -12,6 +12,7 @@ router.use(authMiddleware, requireRole(['admin']));
 router.get('/documents', adminConfigController.getDocumentChecklistConfig);
 router.get('/overview-stats', adminConfigController.getAdminOverviewStats);
 router.get('/system-logs', adminConfigController.getSystemLogs);
+router.get('/workflow-integrity', adminConfigController.getWorkflowIntegrityReport);
 router.get('/fees', adminConfigController.getFeeConfiguration);
 router.get('/settings', adminConfigController.getSystemSettings);
 

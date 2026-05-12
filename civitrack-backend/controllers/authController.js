@@ -4,6 +4,37 @@ const { generateToken } = require('../utils/jwt');
 const { validateApplicantRegistration, validateFullName, validatePhone, normalizePhone, validatePassword } = require('../utils/validation');
 const { generateOTP, sendVerificationEmail, sendPasswordResetEmail } = require('../utils/emailService');
 
+const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+const rateLimitBuckets = {
+  forgotPassword: new Map(),
+  resendVerification: new Map(),
+  verifyResetToken: new Map(),
+  resetPassword: new Map(),
+  verifyEmail: new Map(),
+};
+
+const rateLimitKey = (prefix, value) => `${prefix}:${String(value || '').trim().toLowerCase()}`;
+
+const enforceRateLimit = ({ bucket, key, maxAttempts, windowMs, res, message }) => {
+  const now = Date.now();
+  const recent = (bucket.get(key) || []).filter((timestamp) => now - timestamp < windowMs);
+  if (recent.length >= maxAttempts) {
+    return res.status(429).json({ error: message });
+  }
+  recent.push(now);
+  bucket.set(key, recent);
+  return null;
+};
+
+const maskEmailForLog = (value) => {
+  const email = String(value || '').trim().toLowerCase();
+  const at = email.indexOf('@');
+  if (at <= 1) return '***';
+  return `${email.slice(0, 2)}***${email.slice(at)}`;
+};
+
+const sanitizeErrorForLog = (error) => (error && error.message ? error.message : String(error || 'unknown'));
+
 const hasDuplicateApplicantContact = async (client, normalizedContact, excludeApplicantId = null) => {
   const { rows } = await client.query(
     'SELECT id, contact_number FROM applicants WHERE contact_number IS NOT NULL'
@@ -128,7 +159,10 @@ exports.register = async (req, res) => {
     const emailResult = await sendVerificationEmail(email, fullName, verificationCode);
 
     if (!emailResult.success) {
-      console.error('Failed to send verification email:', emailResult.error);
+      console.error('Failed to send verification email', {
+        email: maskEmailForLog(email),
+        reason: sanitizeErrorForLog(emailResult.error),
+      });
       // Don't fail registration if email fails, user can resend
     }
 
@@ -156,7 +190,6 @@ exports.register = async (req, res) => {
 exports.login = async (req, res) => {
   try {
     const { email, password } = req.body;
-    console.log('Login attempt:', { email, passwordLength: password?.length });
 
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' });
@@ -175,21 +208,16 @@ exports.login = async (req, res) => {
     `;
 
     const result = await pool.query(query, [email]);
-    console.log('Query result rows:', result.rows.length);
 
     if (result.rows.length === 0) {
-      console.log('No user found with email:', email);
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
     const user = result.rows[0];
-    console.log('User found:', { id: user.id, email: user.email, account_type: user.account_type });
     
     const passwordMatch = await bcrypt.compare(password, user.password_hash);
-    console.log('Password match:', passwordMatch);
 
     if (!passwordMatch) {
-      console.log('Password does not match');
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
@@ -282,6 +310,16 @@ exports.forgotPassword = async (req, res) => {
       return res.status(400).json({ error: 'Email is required' });
     }
 
+    const rateLimited = enforceRateLimit({
+      bucket: rateLimitBuckets.forgotPassword,
+      key: rateLimitKey('forgot-password', email),
+      maxAttempts: 5,
+      windowMs: RATE_LIMIT_WINDOW_MS,
+      res,
+      message: 'Too many reset requests. Please wait before trying again.',
+    });
+    if (rateLimited) return rateLimited;
+
     const accountLookup = await pool.query(
       `SELECT id, full_name, 'applicant' AS account_type FROM applicants WHERE email = $1 AND is_active = true
        UNION ALL
@@ -309,7 +347,10 @@ exports.forgotPassword = async (req, res) => {
     const emailResult = await sendPasswordResetEmail(email, user.full_name, resetToken);
 
     if (!emailResult.success) {
-      console.error('Failed to send password reset email:', emailResult.error);
+      console.error('Failed to send password reset email', {
+        email: maskEmailForLog(email),
+        reason: sanitizeErrorForLog(emailResult.error),
+      });
       // Still return success to not reveal email existence
     }
 
@@ -332,6 +373,16 @@ exports.verifyResetToken = async (req, res) => {
     if (!email || !token) {
       return res.status(400).json({ error: 'Email and token are required' });
     }
+
+    const rateLimited = enforceRateLimit({
+      bucket: rateLimitBuckets.verifyResetToken,
+      key: rateLimitKey('verify-reset-token', `${email}:${token}`),
+      maxAttempts: 8,
+      windowMs: RATE_LIMIT_WINDOW_MS,
+      res,
+      message: 'Too many verification attempts. Please request a new reset code.',
+    });
+    if (rateLimited) return rateLimited;
 
     const result = await pool.query(
       'SELECT id FROM password_resets WHERE email = $1 AND token = $2 AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1',
@@ -357,6 +408,16 @@ exports.resetPassword = async (req, res) => {
     if (!email || !token || !newPassword) {
       return res.status(400).json({ error: 'All fields are required' });
     }
+
+    const rateLimited = enforceRateLimit({
+      bucket: rateLimitBuckets.resetPassword,
+      key: rateLimitKey('reset-password', `${email}:${token}`),
+      maxAttempts: 5,
+      windowMs: RATE_LIMIT_WINDOW_MS,
+      res,
+      message: 'Too many reset attempts. Please request a new reset code.',
+    });
+    if (rateLimited) return rateLimited;
 
     // Validate password strength
     const passwordValidation = require('../utils/validation').validatePassword(newPassword);
@@ -572,7 +633,11 @@ exports.resetStaffPassword = async (req, res) => {
       [hashedPassword, staff.id]
     );
 
-    console.log(`Admin ${req.user.userId} reset password for staff ${staff.staff_id}`);
+    console.info('Admin reset staff password', {
+      actorId: req.user.userId,
+      staffId: staff.staff_id,
+      email: maskEmailForLog(staffEmail),
+    });
 
     res.json({ 
       message: 'Staff password reset successfully',
@@ -592,6 +657,16 @@ exports.verifyEmail = async (req, res) => {
     if (!email || !code) {
       return res.status(400).json({ error: 'Email and verification code are required' });
     }
+
+    const rateLimited = enforceRateLimit({
+      bucket: rateLimitBuckets.verifyEmail,
+      key: rateLimitKey('verify-email', `${email}:${code}`),
+      maxAttempts: 8,
+      windowMs: RATE_LIMIT_WINDOW_MS,
+      res,
+      message: 'Too many verification attempts. Please request a new verification code.',
+    });
+    if (rateLimited) return rateLimited;
 
     const { rows } = await pool.query(
       'SELECT id, applicant_ref_id AS applicant_id, full_name, email, verification_code, verification_code_expires, email_verified FROM applicants WHERE email = $1',
@@ -660,6 +735,16 @@ exports.resendVerificationCode = async (req, res) => {
       return res.status(400).json({ error: 'Email is required' });
     }
 
+    const rateLimited = enforceRateLimit({
+      bucket: rateLimitBuckets.resendVerification,
+      key: rateLimitKey('resend-verification', email),
+      maxAttempts: 5,
+      windowMs: RATE_LIMIT_WINDOW_MS,
+      res,
+      message: 'Too many resend requests. Please wait before requesting another code.',
+    });
+    if (rateLimited) return rateLimited;
+
     const { rows } = await pool.query(
       'SELECT id, full_name, email, email_verified FROM applicants WHERE email = $1 AND email_verified = false',
       [email]
@@ -684,7 +769,10 @@ exports.resendVerificationCode = async (req, res) => {
     const emailResult = await sendVerificationEmail(user.email, user.full_name, verificationCode);
 
     if (!emailResult.success) {
-      console.error('Failed to send verification email:', emailResult.error);
+      console.error('Failed to send verification email', {
+        email: maskEmailForLog(user.email),
+        reason: sanitizeErrorForLog(emailResult.error),
+      });
       return res.status(500).json({ error: 'Failed to send verification email. Please try again.' });
     }
 

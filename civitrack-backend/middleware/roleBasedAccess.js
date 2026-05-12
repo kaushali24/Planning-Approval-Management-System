@@ -1,5 +1,25 @@
+/**
+ * Role-scoped auth: same Bearer contract as `middleware/auth.js`, but adds **403** when the token is
+ * valid yet the role is not in `allowedRoles`.
+ *
+ * `isApplicationOwner` enforces applicant row ownership by `applications.applicant_id`; staff/admin
+ * paths skip that check by design (see inline branch).
+ */
 const jwt = require('jsonwebtoken');
 const { sendError } = require('./errorHandler');
+
+const extractBearerToken = (authorizationHeader) => {
+  if (!authorizationHeader || typeof authorizationHeader !== 'string') {
+    return { token: null, malformed: false };
+  }
+
+  const [scheme, token] = authorizationHeader.trim().split(/\s+/);
+  if (!scheme || !token || scheme.toLowerCase() !== 'bearer') {
+    return { token: null, malformed: true };
+  }
+
+  return { token, malformed: false };
+};
 
 /**
  * Verify JWT and extract user info
@@ -13,14 +33,18 @@ const verifyToken = (token) => {
 };
 
 /**
- * Middleware: Require specific roles
- * Usage: app.get('/path', requireRole(['admin', 'staff']), controller)
+ * Middleware: require one of `allowedRoles` on a valid JWT.
+ * 401 = missing/invalid token; 403 = valid token but role not allowed.
  */
 const requireRole = (allowedRoles) => {
   return (req, res, next) => {
     try {
-      const token = req.headers.authorization?.split(' ')[1];
-      
+      const { token, malformed } = extractBearerToken(req.headers.authorization);
+
+      if (malformed) {
+        return sendError(res, 401, 'Authorization header must be in Bearer token format', { code: 'AUTH_TOKEN_MALFORMED' });
+      }
+
       if (!token) {
         return sendError(res, 401, 'No token provided', { code: 'AUTH_TOKEN_MISSING' });
       }
@@ -50,8 +74,8 @@ const requireRole = (allowedRoles) => {
  * Admin can access all
  */
 const canAccessApplication = (req, res, next) => {
-  // This middleware expects req.user to be set and application to be fetched
-  // It will be used after application is loaded from database
+  // Placeholder for a richer policy (assignment/department). Callers today rely on `isApplicationOwner`
+  // or controller-level checks; keep this a no-op so route stacks do not break.
   next();
 };
 
@@ -84,6 +108,7 @@ const isApplicationOwner = (pool) => {
           return sendError(res, 404, 'Application not found', { code: 'APPLICATION_NOT_FOUND' });
         }
 
+        // Authenticated applicant, but not the owner of this application row.
         if (result.rows[0].applicant_id !== user.userId) {
           return sendError(res, 403, 'You do not have access to this application', { code: 'AUTH_FORBIDDEN' });
         }

@@ -3,6 +3,7 @@
 !README.md
 !/civitrack-backend/README.md
 !/civitrack-react/README.md
+!/civitrack-react/src/pages/reports/REPORTS_QA_CHECKLIST.md
 
 # Node modules
 node_modules/
@@ -55,11 +56,14 @@ civitrack-backend/database/schema_update.sql
 # Diagram source files
 diagrams/
 
-# Old/duplicate source folder
-src/
+# Old/duplicate source folder at repository root only
+/src/
 
 # Project-specific exclusions
 CiviTrack.html
 generate_diagrams.py
 check_accounts.sql
 *.pdf
+
+# Runtime uploads (never commit user documents)
+civitrack-backend/uploads/

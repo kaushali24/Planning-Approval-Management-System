@@ -1,3 +1,9 @@
+/**
+ * Shared PostgreSQL pool. `DATABASE_URL` must be set in every environment (see `.env.example`).
+ *
+ * Why session timezone: business dates in reports and audit trails align to Sri Lanka local time
+ * (`Asia/Colombo`) regardless of where the Node process runs.
+ */
 const { Pool } = require('pg');
 require('dotenv').config();
 

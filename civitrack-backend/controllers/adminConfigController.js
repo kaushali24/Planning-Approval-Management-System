@@ -28,19 +28,7 @@ const SYSTEM_SETTING_KEY_MAP = {
 
 const SYSTEM_SETTING_ALLOWED_KEYS = Object.keys(SYSTEM_SETTING_KEY_MAP);
 
-const ensureFeeConfigTable = async () => {
-  await pool.query(
-    `CREATE TABLE IF NOT EXISTS admin_fee_config (
-      id SERIAL PRIMARY KEY,
-      fee_type VARCHAR(100) UNIQUE NOT NULL,
-      display_name VARCHAR(255) NOT NULL,
-      amount DECIMAL(12, 2) NOT NULL CHECK (amount >= 0),
-      is_active BOOLEAN NOT NULL DEFAULT TRUE,
-      updated_by INT REFERENCES staff_accounts(id) ON DELETE SET NULL,
-      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-    )`
-  );
-
+const ensureFeeConfigDefaults = async () => {
   for (const fee of DEFAULT_FEE_CONFIG) {
     await pool.query(
       `INSERT INTO admin_fee_config (fee_type, display_name, amount, is_active, updated_at)
@@ -51,17 +39,7 @@ const ensureFeeConfigTable = async () => {
   }
 };
 
-const ensureSystemSettingsTable = async () => {
-  await pool.query(
-    `CREATE TABLE IF NOT EXISTS admin_system_settings (
-      id SERIAL PRIMARY KEY,
-      setting_key VARCHAR(100) UNIQUE NOT NULL,
-      value_boolean BOOLEAN NOT NULL,
-      updated_by INT REFERENCES staff_accounts(id) ON DELETE SET NULL,
-      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-    )`
-  );
-
+const ensureSystemSettingsDefaults = async () => {
   for (const setting of DEFAULT_SYSTEM_SETTINGS) {
     await pool.query(
       `INSERT INTO admin_system_settings (setting_key, value_boolean, updated_at)
@@ -230,7 +208,7 @@ exports.getSystemLogs = async (req, res) => {
 
 exports.getFeeConfiguration = async (req, res) => {
   try {
-    await ensureFeeConfigTable();
+    await ensureFeeConfigDefaults();
 
     const result = await pool.query(
       `SELECT id, fee_type, display_name, amount, is_active, updated_by, updated_at
@@ -247,7 +225,7 @@ exports.getFeeConfiguration = async (req, res) => {
 
 exports.getSystemSettings = async (req, res) => {
   try {
-    await ensureSystemSettingsTable();
+    await ensureSystemSettingsDefaults();
 
     const result = await pool.query(
       `SELECT id, setting_key, value_boolean, updated_by, updated_at
@@ -275,7 +253,7 @@ exports.getSystemSettings = async (req, res) => {
 
 exports.updateSystemSetting = async (req, res) => {
   try {
-    await ensureSystemSettingsTable();
+    await ensureSystemSettingsDefaults();
 
     const key = normalizeKey(req.params.key);
     const enabled = req.body.enabled === true;
@@ -313,7 +291,7 @@ exports.updateSystemSetting = async (req, res) => {
 
 exports.updateFeeConfigurationItem = async (req, res) => {
   try {
-    await ensureFeeConfigTable();
+    await ensureFeeConfigDefaults();
 
     const feeType = normalizeKey(req.params.feeType);
     const amount = Number(req.body.amount);
@@ -348,5 +326,68 @@ exports.updateFeeConfigurationItem = async (req, res) => {
   } catch (error) {
     console.error('Update fee configuration error:', error);
     return res.status(500).json({ error: 'Failed to update fee configuration' });
+  }
+};
+
+exports.getWorkflowIntegrityReport = async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(Number.parseInt(req.query.limit, 10) || 100, 1), 500);
+
+    const mismatchResult = await pool.query(
+      `SELECT
+         a.id,
+         a.application_code,
+         a.status AS stored_status,
+         latest.status AS latest_history_status,
+         latest.changed_at AS latest_history_changed_at
+       FROM applications a
+       LEFT JOIN LATERAL (
+         SELECT ash.status, ash.changed_at
+         FROM application_status_history ash
+         WHERE ash.application_id = a.id
+         ORDER BY ash.changed_at DESC, ash.id DESC
+         LIMIT 1
+       ) latest ON TRUE
+       WHERE latest.status IS NOT NULL
+         AND a.status <> latest.status
+       ORDER BY latest.changed_at DESC NULLS LAST, a.id DESC
+       LIMIT $1`,
+      [limit]
+    );
+
+    const summaryResult = await pool.query(
+      `SELECT
+         COUNT(*)::int AS total_applications,
+         COUNT(*) FILTER (WHERE latest.status IS NULL)::int AS missing_history_rows,
+         COUNT(*) FILTER (WHERE latest.status IS NOT NULL AND a.status <> latest.status)::int AS status_mismatches
+       FROM applications a
+       LEFT JOIN LATERAL (
+         SELECT ash.status
+         FROM application_status_history ash
+         WHERE ash.application_id = a.id
+         ORDER BY ash.changed_at DESC, ash.id DESC
+         LIMIT 1
+       ) latest ON TRUE`
+    );
+
+    const summary = summaryResult.rows[0] || {
+      total_applications: 0,
+      missing_history_rows: 0,
+      status_mismatches: 0,
+    };
+
+    return res.json({
+      summary: {
+        totalApplications: Number(summary.total_applications || 0),
+        missingHistoryRows: Number(summary.missing_history_rows || 0),
+        statusMismatches: Number(summary.status_mismatches || 0),
+      },
+      mismatches: mismatchResult.rows,
+      limitApplied: limit,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('Get workflow integrity report error:', error);
+    return res.status(500).json({ error: 'Failed to generate workflow integrity report' });
   }
 };

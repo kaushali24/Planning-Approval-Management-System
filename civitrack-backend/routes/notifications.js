@@ -34,9 +34,12 @@ const handleNotificationResult = (res, result, successMessage) => {
     });
   }
 
-  return sendError(res, 500, 'Failed to send notification', {
-    code: 'NOTIFICATION_SEND_FAILED',
-    details: result && result.error ? result.error : 'Unknown email service error',
+  // Non-blocking behavior: API returns accepted even when email delivery failed.
+  return res.status(202).json({
+    success: false,
+    message: `${successMessage} (delivery failed but request accepted)`,
+    warning: result && result.error ? result.error : 'Unknown email service error',
+    code: 'NOTIFICATION_SEND_FAILED_NON_BLOCKING',
   });
 };
 

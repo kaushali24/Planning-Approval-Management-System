@@ -1,6 +1,7 @@
 const { validationResult } = require('express-validator');
 const pool = require('../config/db');
 const { sendError } = require('../middleware/errorHandler');
+const { applyStatusTransition } = require('../utils/applicationStatusUpdater');
 
 const STAFF_ROLES = ['planning_officer', 'technical_officer', 'superintendent', 'committee', 'admin'];
 const APPEAL_STATUSES = [
@@ -12,6 +13,23 @@ const APPEAL_STATUSES = [
   'resolved',
   'rejected',
 ];
+const APPEAL_VERSION_ALLOWED_STATUSES = ['submitted', 'under-review', 'routed-to-to', 'resubmit-required', 'forwarded-to-committee'];
+const APPEAL_ROUTES = ['committee', 'planning-section', 'technical-officer', 'superintendent'];
+const INITIAL_STATUS_BY_ROUTE = {
+  committee: 'forwarded-to-committee',
+  'planning-section': 'under-review',
+  'technical-officer': 'routed-to-to',
+  superintendent: 'under-review',
+};
+const APPEAL_STATUS_TRANSITIONS = {
+  submitted: ['under-review', 'routed-to-to', 'forwarded-to-committee', 'resubmit-required', 'rejected'],
+  'under-review': ['routed-to-to', 'forwarded-to-committee', 'resubmit-required', 'resolved', 'rejected'],
+  'routed-to-to': ['under-review', 'forwarded-to-committee', 'resubmit-required', 'rejected'],
+  'forwarded-to-committee': ['resubmit-required', 'resolved', 'rejected'],
+  'resubmit-required': ['submitted', 'under-review', 'forwarded-to-committee'],
+  resolved: [],
+  rejected: [],
+};
 
 const isApplicant = (user) => user.accountType === 'applicant' || user.role === 'applicant';
 const isStaff = (user) => STAFF_ROLES.includes(user.role);
@@ -28,19 +46,13 @@ const applyStatusWithFallback = async (client, applicationId, preferredStatuses,
   for (const status of preferredStatuses) {
     try {
       await client.query('SAVEPOINT app_status_attempt');
-
-      await client.query(
-        `UPDATE applications
-         SET status = $1, last_updated = NOW()
-         WHERE id = $2`,
-        [status, applicationId]
-      );
-
-      await client.query(
-        `INSERT INTO application_status_history (application_id, status, changed_by, reason)
-         VALUES ($1, $2, $3, $4)`,
-        [applicationId, status, changedBy, reason]
-      );
+      await applyStatusTransition({
+        client,
+        applicationId,
+        toStatus: status,
+        changedBy,
+        reason,
+      });
 
       await client.query('RELEASE SAVEPOINT app_status_attempt');
       return status;
@@ -119,6 +131,30 @@ exports.createAppealCase = async (req, res) => {
 
     await client.query('BEGIN');
 
+    const applicationStatusResult = await client.query(
+      `SELECT id, status
+       FROM applications
+       WHERE id = $1
+       FOR UPDATE`,
+      [application_id]
+    );
+    if (!applicationStatusResult.rows.length) {
+      await client.query('ROLLBACK');
+      return sendError(res, 404, 'Application not found', {
+        code: 'APPLICATION_NOT_FOUND',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
+    if (applicationStatusResult.rows[0].status !== 'not_granted_appeal_required') {
+      await client.query('ROLLBACK');
+      return sendError(res, 400, 'Appeals are allowed only when application status is not_granted_appeal_required', {
+        code: 'APPEAL_NOT_ELIGIBLE_STATUS',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
+
     const existing = await client.query('SELECT id FROM appeal_cases WHERE application_id = $1', [application_id]);
     if (existing.rows.length) {
       await client.query('ROLLBACK');
@@ -129,11 +165,12 @@ exports.createAppealCase = async (req, res) => {
       });
     }
 
+    const initialStatus = INITIAL_STATUS_BY_ROUTE[route] || 'forwarded-to-committee';
     const appealCaseResult = await client.query(
       `INSERT INTO appeal_cases (application_id, route, status, additional_fee, portal_open)
-       VALUES ($1, $2, 'submitted', $3, TRUE)
+       VALUES ($1, $2, $3, $4, TRUE)
        RETURNING *`,
-      [application_id, route, additional_fee || null]
+      [application_id, route, initialStatus, additional_fee || null]
     );
 
     const appealCase = appealCaseResult.rows[0];
@@ -174,9 +211,9 @@ exports.createAppealCase = async (req, res) => {
     await applyStatusWithFallback(
       client,
       application_id,
-      ['appeal_submitted', 'under_review', 'pending'],
+      ['committee_review', 'appeal_submitted', 'under_review', 'pending'],
       getChangedByStaffId(user),
-      'Appeal case created'
+      initialStatus === 'forwarded-to-committee' ? 'Appeal submitted and forwarded to committee' : `Appeal submitted via ${route}`
     );
 
     await client.query('COMMIT');
@@ -188,6 +225,15 @@ exports.createAppealCase = async (req, res) => {
     });
   } catch (error) {
     await client.query('ROLLBACK');
+
+    if (error.code === '23505' && String(error.constraint || '').includes('appeal_cases_application')) {
+      return sendError(res, 409, 'Appeal case already exists for this application', {
+        code: 'APPEAL_ALREADY_EXISTS',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
+
     console.error('Create appeal case error:', error);
     res.status(500).json({
       success: false,
@@ -406,11 +452,32 @@ exports.addAppealVersion = async (req, res) => {
 
     await client.query('BEGIN');
 
-    const caseResult = await client.query('SELECT * FROM appeal_cases WHERE id = $1', [id]);
+    const caseResult = await client.query('SELECT * FROM appeal_cases WHERE id = $1 FOR UPDATE', [id]);
     if (!caseResult.rows.length) {
       await client.query('ROLLBACK');
       return sendError(res, 404, 'Appeal case not found', {
         code: 'APPEAL_NOT_FOUND',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
+    const appealCase = caseResult.rows[0];
+    if (!APPEAL_VERSION_ALLOWED_STATUSES.includes(appealCase.status)) {
+      await client.query('ROLLBACK');
+      return sendError(res, 400, 'Cannot add a new appeal version in the current appeal status', {
+        code: 'APPEAL_VERSION_STATUS_BLOCKED',
+        details: {
+          currentStatus: appealCase.status,
+          allowedStatuses: APPEAL_VERSION_ALLOWED_STATUSES,
+        },
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
+    if (isApplicant(user) && appealCase.portal_open !== true) {
+      await client.query('ROLLBACK');
+      return sendError(res, 403, 'Appeal portal is closed for this case', {
+        code: 'APPEAL_PORTAL_CLOSED',
         path: req.originalUrl,
         method: req.method,
       });
@@ -450,11 +517,17 @@ exports.addAppealVersion = async (req, res) => {
       );
     }
 
+    const nextStatusForVersion = contains_new_plans ? 'under-review' : 'forwarded-to-committee';
+    const allowedFromCurrent = APPEAL_STATUS_TRANSITIONS[appealCase.status] || [];
+    const targetStatus = allowedFromCurrent.includes(nextStatusForVersion)
+      ? nextStatusForVersion
+      : (allowedFromCurrent.includes('forwarded-to-committee') ? 'forwarded-to-committee' : appealCase.status);
+
     await client.query(
       `UPDATE appeal_cases
-       SET status = 'submitted', updated_at = NOW(), portal_open = TRUE
+       SET status = $2, updated_at = NOW(), portal_open = TRUE
        WHERE id = $1`,
-      [id]
+      [id, targetStatus]
     );
 
     await client.query('COMMIT');
@@ -465,6 +538,13 @@ exports.addAppealVersion = async (req, res) => {
     });
   } catch (error) {
     await client.query('ROLLBACK');
+    if (error.code === '23505') {
+      return sendError(res, 409, 'Appeal version conflict detected. Please retry.', {
+        code: 'APPEAL_VERSION_CONFLICT',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
     console.error('Add appeal version error:', error);
     res.status(500).json({
       success: false,
@@ -556,6 +636,29 @@ exports.updateAppealStatus = async (req, res) => {
 
     const { id } = req.params;
     const { status, route, portal_open, additional_fee } = req.body;
+    if (route && !APPEAL_ROUTES.includes(route)) {
+      return sendError(res, 400, 'Invalid route value', {
+        code: 'VALIDATION_ERROR',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
+
+    if (status === 'forwarded-to-committee' && route && route !== 'committee') {
+      return sendError(res, 400, 'forwarded-to-committee status requires route=committee', {
+        code: 'APPEAL_ROUTE_STATUS_MISMATCH',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
+    if (status === 'routed-to-to' && route && route !== 'technical-officer') {
+      return sendError(res, 400, 'routed-to-to status requires route=technical-officer', {
+        code: 'APPEAL_ROUTE_STATUS_MISMATCH',
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
+
 
     if (!APPEAL_STATUSES.includes(status)) {
       return sendError(res, 400, `Invalid status. Allowed: ${APPEAL_STATUSES.join(', ')}`, {
@@ -567,7 +670,7 @@ exports.updateAppealStatus = async (req, res) => {
 
     await client.query('BEGIN');
 
-    const caseResult = await client.query('SELECT id, application_id FROM appeal_cases WHERE id = $1', [id]);
+    const caseResult = await client.query('SELECT id, application_id, status FROM appeal_cases WHERE id = $1', [id]);
     if (!caseResult.rows.length) {
       await client.query('ROLLBACK');
       return sendError(res, 404, 'Appeal case not found', {
@@ -578,6 +681,16 @@ exports.updateAppealStatus = async (req, res) => {
     }
 
     const appealCase = caseResult.rows[0];
+    const allowedTransitions = APPEAL_STATUS_TRANSITIONS[appealCase.status] || [];
+    if (!allowedTransitions.includes(status)) {
+      await client.query('ROLLBACK');
+      return sendError(res, 400, `Invalid appeal status transition from ${appealCase.status} to ${status}`, {
+        code: 'APPEAL_INVALID_TRANSITION',
+        details: { fromStatus: appealCase.status, toStatus: status },
+        path: req.originalUrl,
+        method: req.method,
+      });
+    }
 
     const updatedResult = await client.query(
       `UPDATE appeal_cases

@@ -1,10 +1,27 @@
 const jwt = require('jsonwebtoken');
 const { sendError } = require('./errorHandler');
 
+const extractBearerToken = (authorizationHeader) => {
+  if (!authorizationHeader || typeof authorizationHeader !== 'string') {
+    return { token: null, malformed: false };
+  }
+
+  const [scheme, token] = authorizationHeader.trim().split(/\s+/);
+  if (!scheme || !token || scheme.toLowerCase() !== 'bearer') {
+    return { token: null, malformed: true };
+  }
+
+  return { token, malformed: false };
+};
+
 const adminAuthMiddleware = (req, res, next) => {
   try {
-    const token = req.headers.authorization?.split(' ')[1];
-    
+    const { token, malformed } = extractBearerToken(req.headers.authorization);
+
+    if (malformed) {
+      return sendError(res, 401, 'Authorization header must be in Bearer token format', { code: 'AUTH_TOKEN_MALFORMED' });
+    }
+
     if (!token) {
       return sendError(res, 401, 'No token provided', { code: 'AUTH_TOKEN_MISSING' });
     }

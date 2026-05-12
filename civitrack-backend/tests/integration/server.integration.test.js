@@ -2,6 +2,7 @@ const request = require('supertest');
 
 describe('server integration', () => {
   jest.setTimeout(15000);
+  const originalEnablePublicUploads = process.env.ENABLE_PUBLIC_UPLOADS;
 
   const loadAppWithPoolQuery = (poolQueryImpl) => {
     jest.resetModules();
@@ -13,6 +14,7 @@ describe('server integration', () => {
 
   afterEach(() => {
     jest.dontMock('../../config/db');
+    process.env.ENABLE_PUBLIC_UPLOADS = originalEnablePublicUploads;
     jest.resetModules();
   });
 
@@ -61,5 +63,30 @@ describe('server integration', () => {
         }),
       })
     );
+  });
+
+  test('deprecated /api/coc route emits deprecation metadata headers', async () => {
+    const app = loadAppWithPoolQuery(async () => ({ rows: [] }));
+    const response = await request(app).get('/api/coc');
+
+    expect(response.headers.deprecation).toBe('true');
+    expect(response.headers.sunset).toBeTruthy();
+    expect(response.headers.link).toContain('/api/coc-requests');
+  });
+
+  test('requires auth for /uploads when public uploads are disabled', async () => {
+    process.env.ENABLE_PUBLIC_UPLOADS = 'false';
+    const app = loadAppWithPoolQuery(async () => ({ rows: [] }));
+    const response = await request(app).get('/uploads/non-existent-file.txt');
+
+    expect(response.status).toBe(401);
+  });
+
+  test('requires auth for /uploads even when public uploads flag is enabled', async () => {
+    process.env.ENABLE_PUBLIC_UPLOADS = 'true';
+    const app = loadAppWithPoolQuery(async () => ({ rows: [] }));
+    const response = await request(app).get('/uploads/non-existent-file.txt');
+
+    expect(response.status).toBe(401);
   });
 });

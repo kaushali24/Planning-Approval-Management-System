@@ -1,3 +1,11 @@
+/**
+ * Canonical HTTP error envelope for this API (used by the React app and tests).
+ *
+ * Why this shape: one predictable JSON contract so clients never parse ad-hoc strings.
+ * Invariants:
+ * - Production strips `error.details` on 5xx to avoid leaking stack/internal context.
+ * - Tests skip console noise from the global handler so Jest output stays readable.
+ */
 const { validationResult } = require('express-validator');
 
 const DEFAULT_ERROR_CODE = 'INTERNAL_SERVER_ERROR';
@@ -80,6 +88,7 @@ const globalErrorHandler = (err, req, res, next) => {
   const code = err.code || (status >= 500 ? 'INTERNAL_SERVER_ERROR' : 'REQUEST_ERROR');
   const message = err.message || 'An unexpected error occurred';
 
+  // Log server-side only; clients receive the JSON body below (no stack in production 5xx payload).
   if (process.env.NODE_ENV !== 'test') {
     console.error('Unhandled API error:', {
       status,
@@ -93,6 +102,7 @@ const globalErrorHandler = (err, req, res, next) => {
 
   return sendError(res, status, message, {
     code,
+    // Edge case: never attach raw `details` on 5xx in production (may contain stack or DB snippets).
     details: status >= 500 && process.env.NODE_ENV === 'production' ? undefined : err.details,
     path: req.originalUrl,
     method: req.method,

@@ -1,4 +1,5 @@
 const pool = require('../config/db');
+const { applyStatusTransition } = require('../utils/applicationStatusUpdater');
 
 const canAccessApplication = async (applicationId, staffId) => {
   const result = await pool.query(
@@ -61,6 +62,23 @@ exports.scheduleInspectionForApplication = async (req, res) => {
 
     await client.query('BEGIN');
 
+    const appRow = await client.query(
+      `SELECT id, status FROM applications WHERE id = $1 FOR UPDATE`,
+      [applicationId]
+    );
+    if (!appRow.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Application not found' });
+    }
+    if (appRow.rows[0].status !== 'under_review') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'Inspections can only be scheduled while the application is under technical review (under_review)',
+        code: 'INVALID_STATUS_FOR_INSPECTION_SCHEDULE',
+        currentStatus: appRow.rows[0].status,
+      });
+    }
+
     const existing = await client.query(
       `SELECT id
        FROM inspections
@@ -90,18 +108,14 @@ exports.scheduleInspectionForApplication = async (req, res) => {
       inspection = insertResult.rows[0];
     }
 
-    await client.query(
-      `UPDATE applications
-       SET status = 'under_review', last_updated = NOW()
-       WHERE id = $1`,
-      [applicationId]
-    );
-
-    await client.query(
-      `INSERT INTO application_status_history (application_id, status, changed_at, changed_by, reason, source_stage)
-       VALUES ($1, 'under_review', NOW(), $2, $3, 'inspection-scheduled')`,
-      [applicationId, staffId, 'Site inspection scheduled by Technical Officer']
-    );
+    await applyStatusTransition({
+      client,
+      applicationId,
+      toStatus: 'under_review',
+      changedBy: staffId,
+      reason: 'Site inspection scheduled by Technical Officer',
+      sourceStage: 'inspection-scheduled',
+    });
 
     await client.query('COMMIT');
 
@@ -118,23 +132,113 @@ exports.scheduleInspectionForApplication = async (req, res) => {
   }
 };
 
+const {
+  buildDocumentStorageInfo,
+  moveUploadedFile,
+  removeFileIfExists,
+} = require('../utils/documentStorage');
+
 exports.submitInspectionReportForApplication = async (req, res) => {
   const client = await pool.connect();
+  let persistedFiles = [];
   try {
     const applicationId = Number.parseInt(req.params.applicationId, 10);
     const staffId = req.user.userId;
-    const { recommendation, observations, result } = req.body;
+    const { recommendation, observations, result, far_observed, setback_observed, plot_coverage_observed } = req.body;
+
+    let finalObservations = observations || '';
+    if (far_observed || setback_observed || plot_coverage_observed) {
+      finalObservations = `
+[TECHNICAL METRICS]
+FAR: ${far_observed || 'N/A'}
+Setbacks: ${setback_observed || 'N/A'}
+Plot Coverage: ${plot_coverage_observed || 'N/A'}
+
+[SITE FINDINGS]
+${observations || 'No additional observations recorded.'}
+      `.trim();
+    }
 
     const hasAccess = await canAccessApplication(applicationId, staffId);
     if (!hasAccess) {
       return res.status(403).json({ error: 'This application is not assigned to you' });
     }
 
+    // Get application details for document storage
+    const appResult = await client.query(
+      `SELECT a.application_code, a.applicant_id, ap.applicant_ref_id
+       FROM applications a
+       JOIN applicants ap ON ap.id = a.applicant_id
+       WHERE a.id = $1`,
+      [applicationId]
+    );
+
+    if (!appResult.rows.length) {
+      return res.status(404).json({ error: 'Application not found' });
+    }
+    const app = appResult.rows[0];
+
     const normalizedRecommendation = recommendation === 'not-granted' ? 'reject' : recommendation;
     const normalizedResult = result || (normalizedRecommendation === 'approve' || normalizedRecommendation === 'conditional' ? 'compliant' : 'deviation');
 
     await client.query('BEGIN');
 
+    const appStatusRow = await client.query(
+      `SELECT status FROM applications WHERE id = $1 FOR UPDATE`,
+      [applicationId]
+    );
+    if (!appStatusRow.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Application not found' });
+    }
+    if (appStatusRow.rows[0].status !== 'under_review') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'Inspection reports can only be submitted while the application is under technical review (under_review)',
+        code: 'INVALID_STATUS_FOR_INSPECTION_REPORT',
+        currentStatus: appStatusRow.rows[0].status,
+      });
+    }
+
+    // 1. Process Files
+    const files = Array.isArray(req.files)
+      ? req.files
+      : Object.values(req.files || {}).flat();
+    for (const file of files) {
+      // Determine document category
+      // If the fieldname is 'report', it's the main report. Otherwise, if it starts with 'photo', it's a site photo.
+      const isReport = file.fieldname === 'report' || file.mimetype === 'application/pdf';
+      const documentCategory = isReport ? 'technical_report' : 'site_photo';
+      const docType = isReport ? 'Technical Inspection Report' : 'Site Inspection Photo';
+
+      const storageInfo = buildDocumentStorageInfo({
+        applicantRefId: app.applicant_ref_id,
+        applicationCode: app.application_code,
+        documentCategory,
+        filename: file.filename,
+      });
+
+      await moveUploadedFile(file.path, storageInfo.absolutePath);
+      persistedFiles.push({ path: storageInfo.absolutePath });
+
+      // Insert document record
+      await client.query(
+        `INSERT INTO documents (
+          application_id, applicant_ref_id, application_code,
+          doc_type, document_category, original_filename,
+          stored_filename, storage_key, file_url, mime_type, file_size
+        )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [
+          applicationId, app.applicant_ref_id, app.application_code,
+          docType, documentCategory, file.originalname,
+          file.filename, storageInfo.relativePath, storageInfo.relativePath,
+          file.mimetype, file.size
+        ]
+      );
+    }
+
+    // 2. Update Inspection Record
     const existing = await client.query(
       `SELECT id
        FROM inspections
@@ -154,7 +258,7 @@ exports.submitInspectionReportForApplication = async (req, res) => {
              scheduled_date = COALESCE(scheduled_date, NOW())
          WHERE id = $4
          RETURNING *`,
-        [normalizedResult, observations || null, normalizedRecommendation || null, existing.rows[0].id]
+        [normalizedResult, finalObservations || null, normalizedRecommendation || null, existing.rows[0].id]
       );
       inspection = updateResult.rows[0];
     } else {
@@ -162,32 +266,34 @@ exports.submitInspectionReportForApplication = async (req, res) => {
         `INSERT INTO inspections (application_id, staff_id, scheduled_date, result, observations, recommendation)
          VALUES ($1, $2, NOW(), $3, $4, $5)
          RETURNING *`,
-        [applicationId, staffId, normalizedResult, observations || null, normalizedRecommendation || null]
+        [applicationId, staffId, normalizedResult, finalObservations || null, normalizedRecommendation || null]
       );
       inspection = insertResult.rows[0];
     }
 
-    await client.query(
-      `UPDATE applications
-       SET status = 'committee_review', last_updated = NOW()
-       WHERE id = $1`,
-      [applicationId]
-    );
-
-    await client.query(
-      `INSERT INTO application_status_history (application_id, status, changed_at, changed_by, reason, source_stage)
-       VALUES ($1, 'committee_review', NOW(), $2, $3, 'to-report-submitted')`,
-      [applicationId, staffId, 'Technical Officer submitted inspection report']
-    );
+    // 3. Update Application Status
+    await applyStatusTransition({
+      client,
+      applicationId,
+      toStatus: 'sw_review_pending',
+      changedBy: staffId,
+      reason: 'Technical Officer submitted inspection report and photos for SW review',
+      sourceStage: 'to-report-submitted',
+    });
 
     await client.query('COMMIT');
 
     res.json({
-      message: 'Inspection report submitted successfully',
+      message: 'Inspection report and photos submitted successfully',
       inspection,
+      fileCount: files.length,
     });
   } catch (error) {
-    await client.query('ROLLBACK');
+    if (client) await client.query('ROLLBACK').catch(() => {});
+    // Cleanup files on error
+    for (const file of persistedFiles) {
+      await removeFileIfExists(file.path).catch(() => {});
+    }
     console.error('Submit inspection report error:', error);
     res.status(500).json({ error: 'Failed to submit inspection report', details: error.message });
   } finally {
@@ -200,7 +306,16 @@ exports.placeHoldForApplication = async (req, res) => {
   try {
     const applicationId = Number.parseInt(req.params.applicationId, 10);
     const staffId = req.user.userId;
-    const { hold_type, reason, clearance_authority } = req.body;
+    const { hold_type, reason, clearance_authority, complaint_source, resolution_steps } = req.body;
+    // Canonical explicit status is 2-way: complaint vs clearance.
+    // Anything that is not an external clearance hold is treated as a complaint-style hold.
+    const holdStatus = hold_type === 'clearance'
+      ? 'hold_clearance'
+      : 'hold_complaint';
+
+    const combinedReason = hold_type === 'complaint' && (complaint_source || resolution_steps)
+      ? `Source: ${complaint_source || 'Unknown'}\nNature: ${reason}\nResolution Step: ${resolution_steps || 'Pending investigation'}`
+      : reason;
 
     const hasAccess = await canAccessApplication(applicationId, staffId);
     if (!hasAccess) {
@@ -232,14 +347,17 @@ exports.placeHoldForApplication = async (req, res) => {
        )
        VALUES ($1, $2, 'active', $3, $4, $5, NOW())
        RETURNING *`,
-      [applicationId, hold_type, reason, clearance_authority || null, staffId]
+      [applicationId, hold_type, combinedReason, clearance_authority || null, staffId]
     );
 
-    await client.query(
-      `INSERT INTO application_status_history (application_id, status, changed_at, changed_by, reason, source_stage)
-       VALUES ($1, 'under_review', NOW(), $2, $3, 'to-hold')`,
-      [applicationId, staffId, `TO hold (${hold_type}): ${reason}`]
-    );
+    await applyStatusTransition({
+      client,
+      applicationId,
+      toStatus: holdStatus,
+      changedBy: staffId,
+      reason: `TO hold (${hold_type}): ${reason}`,
+      sourceStage: 'to-hold',
+    });
 
     await client.query('COMMIT');
 
@@ -271,7 +389,7 @@ exports.resolveHoldForApplication = async (req, res) => {
     await client.query('BEGIN');
 
     const activeHoldResult = await client.query(
-      `SELECT id
+      `SELECT id, hold_type, requested_at
        FROM application_holds
        WHERE application_id = $1
          AND hold_status = 'active'
@@ -285,6 +403,18 @@ exports.resolveHoldForApplication = async (req, res) => {
       return res.status(404).json({ error: 'No active hold found for this application' });
     }
 
+    const priorStatusResult = await client.query(
+      `SELECT ash.status
+       FROM application_status_history ash
+       WHERE ash.application_id = $1
+         AND ash.changed_at < $2
+         AND ash.status NOT IN ('hold_complaint', 'hold_clearance')
+       ORDER BY ash.changed_at DESC, ash.id DESC
+       LIMIT 1`,
+      [applicationId, activeHoldResult.rows[0].requested_at]
+    );
+    const restoredStatus = priorStatusResult.rows[0]?.status || 'under_review';
+
     const resolvedResult = await client.query(
       `UPDATE application_holds
        SET hold_status = 'resolved',
@@ -296,11 +426,14 @@ exports.resolveHoldForApplication = async (req, res) => {
       [staffId, resolution_note, activeHoldResult.rows[0].id]
     );
 
-    await client.query(
-      `INSERT INTO application_status_history (application_id, status, changed_at, changed_by, reason, source_stage)
-       VALUES ($1, 'under_review', NOW(), $2, $3, 'to-hold-resolved')`,
-      [applicationId, staffId, `TO resolved hold: ${resolution_note}`]
-    );
+    await applyStatusTransition({
+      client,
+      applicationId,
+      toStatus: restoredStatus,
+      changedBy: staffId,
+      reason: `TO resolved hold: ${resolution_note || 'No note provided'}`,
+      sourceStage: 'to-hold-resolved',
+    });
 
     await client.query('COMMIT');
 
@@ -354,18 +487,19 @@ exports.declineAssignmentForApplication = async (req, res) => {
 
     await client.query(
       `UPDATE applications
-       SET assigned_to = NULL,
-           status = 'submitted',
-           last_updated = NOW()
+       SET assigned_to = NULL
        WHERE id = $1`,
       [applicationId]
     );
 
-    await client.query(
-      `INSERT INTO application_status_history (application_id, status, changed_at, changed_by, reason, source_stage)
-       VALUES ($1, 'submitted', NOW(), $2, $3, 'to-assignment-declined')`,
-      [applicationId, staffId, `TO declined assignment: ${reason}`]
-    );
+    await applyStatusTransition({
+      client,
+      applicationId,
+      toStatus: 'submitted',
+      changedBy: staffId,
+      reason: `TO declined assignment: ${reason}`,
+      sourceStage: 'to-assignment-declined',
+    });
 
     await client.query('COMMIT');
 
@@ -403,19 +537,14 @@ exports.referBackToTechnicalOfficerForApplication = async (req, res) => {
       return res.status(404).json({ error: 'Application not found' });
     }
 
-    await client.query(
-      `UPDATE applications
-       SET status = 'under_review',
-           last_updated = NOW()
-       WHERE id = $1`,
-      [applicationId]
-    );
-
-    await client.query(
-      `INSERT INTO application_status_history (application_id, status, changed_at, changed_by, reason, source_stage)
-       VALUES ($1, 'under_review', NOW(), $2, $3, 'sw-referred-back')`,
-      [applicationId, staffId, `SW referred back to TO (${referral_type}): ${reason}`]
-    );
+    await applyStatusTransition({
+      client,
+      applicationId,
+      toStatus: 'under_review',
+      changedBy: staffId,
+      reason: `SW referred back to TO (${referral_type}): ${reason}`,
+      sourceStage: 'sw-referred-back',
+    });
 
     await client.query(
       `UPDATE application_assignments
