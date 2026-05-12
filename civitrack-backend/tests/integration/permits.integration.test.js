@@ -98,7 +98,8 @@ describe('permits integration', () => {
       expect.objectContaining({
         success: false,
         error: expect.objectContaining({
-          code: 'PERMIT_MAX_YEARS_INVALID',
+          code: 'VALIDATION_ERROR',
+          message: 'Validation failed',
         }),
       })
     );

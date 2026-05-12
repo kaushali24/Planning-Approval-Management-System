@@ -46,7 +46,7 @@ describe('application reassignment note enforcement integration', () => {
         if (sql.includes('SELECT id, status FROM applications')) {
           return { rows: [{ id: 55, status: 'under_review' }] };
         }
-        if (sql.includes('SELECT id, full_name FROM staff_accounts WHERE id = $1')) {
+        if (sql.includes('FROM staff_accounts') && sql.includes('WHERE id = $1')) {
           return { rows: [{ id: 12, full_name: 'TO New' }] };
         }
         if (sql.includes('SELECT id, assigned_to FROM application_assignments')) {
@@ -72,8 +72,14 @@ describe('application reassignment note enforcement integration', () => {
     const { app } = loadAppWithMocks({
       poolConnectQueryImpl: async (sql) => {
         if (sql === 'BEGIN' || sql === 'ROLLBACK') return { rows: [] };
-        if (sql.includes('SELECT id FROM staff_accounts WHERE id = ANY')) {
+        if (sql.includes('FROM staff_accounts') && sql.includes('WHERE id = ANY')) {
           return { rows: [{ id: 12 }] };
+        }
+        if (sql.includes('FROM staff_accounts') && sql.includes('WHERE id = $1')) {
+          return { rows: [{ id: 12, full_name: 'TO New' }] };
+        }
+        if (sql.includes('FROM staff_accounts') && sql.includes('staff_id = $1')) {
+          return { rows: [{ id: 12, full_name: 'TO New' }] };
         }
         if (sql.includes('SELECT id FROM applications WHERE id = $1 FOR UPDATE')) {
           return { rows: [{ id: 55 }] };

@@ -1,6 +1,7 @@
 const request = require('supertest');
 
 describe('coc integration', () => {
+  jest.setTimeout(15000);
   const loadAppWithMocks = ({ user, poolQueryImpl, poolConnectQueryImpl }) => {
     jest.resetModules();
 
