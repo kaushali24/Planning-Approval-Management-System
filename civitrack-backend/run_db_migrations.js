@@ -8,7 +8,8 @@ const path = require('path');
 const pool = require('./config/db');
 
 const MIGRATIONS_DIR = path.join(__dirname, 'database', 'migrations');
-const BASE_SCHEMA_PATH = path.join(__dirname, 'database', 'schema_update.sql');
+const CORE_SCHEMA_PATH = path.join(__dirname, 'database', 'schema.sql');
+const UPDATE_SCHEMA_PATH = path.join(__dirname, 'database', 'schema_update.sql');
 
 const shouldBootstrapBaseSchema = () => {
   const flag = (process.env.DB_BOOTSTRAP_SCHEMA || '').toLowerCase();
@@ -31,18 +32,30 @@ const bootstrapBaseSchemaIfNeeded = async (client) => {
     return;
   }
 
-  if (!fs.existsSync(BASE_SCHEMA_PATH)) {
-    throw new Error(`Base schema file not found at ${BASE_SCHEMA_PATH}`);
+  if (!fs.existsSync(CORE_SCHEMA_PATH)) {
+    throw new Error(`Core schema file not found at ${CORE_SCHEMA_PATH}`);
+  }
+  if (!fs.existsSync(UPDATE_SCHEMA_PATH)) {
+    throw new Error(`Update schema file not found at ${UPDATE_SCHEMA_PATH}`);
   }
 
-  console.log('Bootstrapping base schema from database/schema_update.sql (DB_BOOTSTRAP_SCHEMA enabled)...');
-  const schemaSql = fs.readFileSync(BASE_SCHEMA_PATH, 'utf8');
-  await client.query(schemaSql);
+  // CI databases start empty; `schema_update.sql` assumes core tables exist.
+  console.log('Bootstrapping base schema (DB_BOOTSTRAP_SCHEMA enabled)...');
+  console.log(' - applying database/schema.sql');
+  await client.query(fs.readFileSync(CORE_SCHEMA_PATH, 'utf8'));
+  console.log(' - applying database/schema_update.sql');
+  await client.query(fs.readFileSync(UPDATE_SCHEMA_PATH, 'utf8'));
   console.log('Base schema bootstrap completed.');
 
-  const nowHasApplications = await doesTableExist(client, 'applications');
-  if (!nowHasApplications) {
-    throw new Error('Base schema bootstrap did not create required table: applications');
+  const [nowHasApplicants, nowHasStaff, nowHasApplications] = await Promise.all([
+    doesTableExist(client, 'applicants'),
+    doesTableExist(client, 'staff_accounts'),
+    doesTableExist(client, 'applications'),
+  ]);
+  if (!nowHasApplicants || !nowHasStaff || !nowHasApplications) {
+    throw new Error(
+      `Base schema bootstrap missing required tables: applicants=${nowHasApplicants}, staff_accounts=${nowHasStaff}, applications=${nowHasApplications}`
+    );
   }
 };
 
