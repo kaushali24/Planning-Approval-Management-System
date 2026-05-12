@@ -31,6 +31,7 @@ DROP TABLE IF EXISTS applications CASCADE;
 -- Applications table
 CREATE TABLE applications (
     id SERIAL PRIMARY KEY,
+    application_code VARCHAR(20) UNIQUE, -- Public business format: APP/YYYY/00001
     applicant_id INT NOT NULL,
     application_type VARCHAR(50) NOT NULL CHECK (application_type IN ('building', 'subdivision')),
     status VARCHAR(60) DEFAULT 'submitted' CHECK (status IN (
@@ -75,6 +76,45 @@ CREATE TABLE applications (
     CONSTRAINT fk_applications_assigned_to FOREIGN KEY (assigned_to) REFERENCES staff_accounts(id) ON DELETE SET NULL,
     CONSTRAINT fk_applications_reviewed_by FOREIGN KEY (reviewed_by) REFERENCES staff_accounts(id) ON DELETE SET NULL
 );
+
+-- Application code format
+-- Public business format: APP/YYYY/00001
+CREATE OR REPLACE FUNCTION generate_application_code()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    year_part INT;
+    next_seq INT;
+BEGIN
+    IF NEW.application_code IS NOT NULL AND BTRIM(NEW.application_code) <> '' THEN
+        RETURN NEW;
+    END IF;
+
+    year_part := EXTRACT(YEAR FROM COALESCE(NEW.submission_date, CURRENT_TIMESTAMP))::INT;
+
+    -- Prevent duplicate sequence generation during concurrent inserts.
+    PERFORM pg_advisory_xact_lock(hashtext('APP/' || year_part::TEXT));
+
+    SELECT COALESCE(MAX(CAST(SPLIT_PART(application_code, '/', 3) AS INT)), 0) + 1
+    INTO next_seq
+    FROM applications
+    WHERE application_code LIKE ('APP/' || year_part::TEXT || '/%');
+
+    NEW.application_code := 'APP/' || year_part::TEXT || '/' || LPAD(next_seq::TEXT, 5, '0');
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_generate_application_code ON applications;
+
+CREATE TRIGGER trg_generate_application_code
+BEFORE INSERT ON applications
+FOR EACH ROW
+EXECUTE FUNCTION generate_application_code();
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_application_code
+ON applications(application_code);
 
 -- Normalized selected permit rows for the application wizard
 CREATE TABLE application_permit_selections (
